@@ -1,0 +1,16 @@
+{
+  "name": "luzhniki-monitor",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node monitor-luzhniki.js",
+    "monitor": "node monitor-luzhniki.js",
+    "playwright:install": "playwright install --with-deps chromium",
+    "test-run": "node -e \"console.log('ok')\""
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.64.0",
+    "playwright": "^1.47.2"
+  }
+}
