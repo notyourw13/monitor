@@ -1,6 +1,8 @@
 // monitor-luzhniki.js
 // Монитор новых слотов Лужники: Playwright + Telegram
-// Автор: ChatGPT
+// Версия с поддержкой прокси
+// ---------------------------------------
+
 import { chromium } from 'playwright';
 import fs from 'fs';
 import TelegramBot from 'node-telegram-bot-api';
@@ -8,29 +10,30 @@ import TelegramBot from 'node-telegram-bot-api';
 const URL = 'https://tennis.luzhniki.ru/#courts';
 const DATA_FILE = './known-slots.json';
 
+// === НАСТРОЙКИ ПРОКСИ ===
+// SOCKS5-прокси (например, бесплатный из списка)
+const PROXY = 'socks5://212.119.236.86:1080';
+
+// === Telegram ===
 const BOT_TOKEN = process.env.TG_BOT_TOKEN || '';
 const CHAT_ID = process.env.TG_CHAT_ID || '';
 const bot = BOT_TOKEN ? new TelegramBot(BOT_TOKEN, { polling: false }) : null;
 
-// Грубый регэксп для времени HH:MM (24ч)
-const timeRe = /\b([01]\d|2[0-3]):[0-5]\d\b/;
+// === Общие утилиты ===
+const timeRe = /\b([01]\d|2[0-3]):[0-5]\d\b/; // время HH:MM
 
 // Универсальная функция извлечения слотов из страницы/фрейма
 async function extractSlots(frameOrPage) {
-  // Ждём стабилизацию сети
   await frameOrPage.waitForLoadState?.('networkidle').catch(() => {});
-
-  // Ждём появление любых элементов, содержащих время
   await frameOrPage.waitForFunction(
     () => {
       const re = /\b([01]\d|2[0-3]):[0-5]\d\b/;
-      const nodes = Array.from(document.querySelectorAll('button, a, div, span'));
-      return nodes.some(el => re.test(el.textContent || ''));
+      return Array.from(document.querySelectorAll('button, a, div, span'))
+        .some(el => re.test(el.textContent || ''));
     },
-    { timeout: 45000 }
+    { timeout: 60000 } // подольше — 60 сек
   );
 
-  // Собираем уникальные ключи "День | Корт | Время"
   const keys = await frameOrPage.$$eval('button, a, div, span', (els) => {
     const timeRe = /\b([01]\d|2[0-3]):[0-5]\d\b/;
     const results = new Set();
@@ -38,7 +41,7 @@ async function extractSlots(frameOrPage) {
     function findAbove(el, regexes, maxDepth = 6) {
       let p = el;
       for (let i = 0; i < maxDepth && p; i++) {
-        const txt = (p.textContent || '').replace(/\s+/g,' ').trim();
+        const txt = (p.textContent || '').replace(/\s+/g, ' ').trim();
         for (const re of regexes) {
           const m = txt.match(re);
           if (m) return m[0];
@@ -53,7 +56,7 @@ async function extractSlots(frameOrPage) {
       const t = txt.match(timeRe)?.[0];
       if (!t) continue;
 
-      // День (разные форматы дат/дней недели на рус/англ)
+      // День
       const day = findAbove(el, [
         /(?:Пн|Вт|Ср|Чт|Пт|Сб|Вс)[^0-9\n]{0,6}\d{1,2}(?:[.\s]?(?:янв|фев|мар|апр|мая|июн|июл|авг|сен|окт|ноя|дек|[01]?\d))?/i,
         /\b\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?\b/,
@@ -61,15 +64,16 @@ async function extractSlots(frameOrPage) {
       ]) || 'День?';
 
       // Корт
-      const court = findAbove(el, [
+      const foundCourt = findAbove(el, [
         /корт[^\d]{0,3}(\d{1,2})/i,
         /court[^\d]{0,3}(\d{1,2})/i
-      ]) ?? '';
+      ]);
+      const court = (foundCourt == null ? '' : foundCourt);
 
       const courtLabel = court
         ? (court.toLowerCase().startsWith('court') || court.toLowerCase().startsWith('корт')
-           ? court.replace(/\s+/g,' ').trim()
-           : `Корт ${court}`)
+          ? court.replace(/\s+/g, ' ').trim()
+          : `Корт ${court}`)
         : 'Корт?';
 
       results.add([String(day).trim(), String(courtLabel).trim(), t].join(' | '));
@@ -81,16 +85,22 @@ async function extractSlots(frameOrPage) {
 }
 
 async function main() {
-  const browser = await chromium.launch({ headless: true });
+  // === Запуск браузера с прокси ===
+  const browser = await chromium.launch({
+    headless: true,
+    args: [`--proxy-server=${PROXY}`]
+  });
+
   const context = await browser.newContext({ locale: 'ru-RU' });
   const page = await context.newPage();
-  await page.goto(URL, { waitUntil: 'domcontentloaded' });
 
-  // Если расписание внутри iframe, найдём «богатый» фрейм (с множеством кнопок)
+  console.log('Открываем страницу через прокси:', PROXY);
+  await page.goto(URL, { waitUntil: 'domcontentloaded', timeout: 60000 }); // 60 сек
+
+  // Если расписание внутри iframe, найдём фрейм
   let target = page;
   const frames = page.frames();
   if (frames.length > 1) {
-    // Выберем фрейм, где обнаружится время HH:MM
     for (const f of frames) {
       if (f === page.mainFrame()) continue;
       try {
@@ -109,7 +119,6 @@ async function main() {
   }
 
   const slots = await extractSlots(target);
-
   const known = fs.existsSync(DATA_FILE) ? JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')) : [];
   const knownSet = new Set(known);
   const fresh = slots.filter(k => !knownSet.has(k));
@@ -135,4 +144,3 @@ main().catch(err => {
   console.error('Ошибка:', err);
   process.exit(1);
 });
-
