@@ -64,7 +64,7 @@ async function extractSlots(frameOrPage) {
       const court = findAbove(el, [
         /корт[^\d]{0,3}(\d{1,2})/i,
         /court[^\d]{0,3}(\d{1,2})/i
-      ]) ??. '';
+      ]) ?? '';
 
       const courtLabel = court
         ? (court.toLowerCase().startsWith('court') || court.toLowerCase().startsWith('корт')
