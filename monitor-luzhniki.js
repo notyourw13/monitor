@@ -1,5 +1,5 @@
 // monitor-luzhniki.js
-// Лужники: монитор НОВЫХ времен (и новых дней) + ротация прокси + Telegram
+// Лужники: монитор НОВЫХ времен (и новых дней) + ротация прокси + Telegram (группировка по дням)
 
 import { chromium } from 'playwright';
 import fs from 'fs';
@@ -82,7 +82,7 @@ async function quickProbe(proxy, i) {
   });
 }
 
-// Извлекаем ТОЛЬКО "день | HH:MM" из ВИДИМЫХ элементов
+// Извлекаем ТОЛЬКО "День | HH:MM" из ВИДИМЫХ элементов
 async function extractDayTimeKeys(frameOrPage) {
   await frameOrPage.waitForLoadState?.('networkidle').catch(() => {});
   await frameOrPage.waitForFunction(() => {
@@ -112,6 +112,7 @@ async function extractDayTimeKeys(frameOrPage) {
              document.contains(n) && n.offsetParent !== null;
     };
     const findDayAbove = (el, maxDepth = 8) => {
+      // ищем рядом сверху обозначение дня/даты (коротко)
       const dayRes = [
         /(?:Пн|Вт|Ср|Чт|Пт|Сб|Вс)\.?/i,
         /\b\d{1,2}\s*(?:янв|фев|мар|апр|мая|июн|июл|авг|сен|окт|ноя|дек)\b/i,
@@ -148,7 +149,7 @@ async function extractDayTimeKeys(frameOrPage) {
 async function tryOneProxy(proxy, i) {
   console.log(`▶ Пробуем прокси [${i + 1}] ${proxy || '(без прокси)'}`);
 
-  // быстрый «пинг» (иначе перепрыгиваем к следующему)
+  // быстрый «пинг»
   try {
     if (proxy) await quickProbe(proxy, i);
     else if (!ALLOW_DIRECT) throw new Error('DIRECT запрещён (ALLOW_DIRECT=0)');
@@ -185,6 +186,28 @@ async function tryOneProxy(proxy, i) {
   });
 }
 
+function buildMessageFromFreshKeys(freshKeys) {
+  // freshKeys: ["Вс | 07:00", "Вс | 22:00", "Пн | 08:00", ...]
+  // группируем по дню
+  const map = new Map();
+  for (const k of freshKeys) {
+    const [dayRaw, timeRaw] = k.split('|').map(s => s.trim());
+    const day = dayRaw || 'День?';
+    const time = timeRaw || '';
+    if (!map.has(day)) map.set(day, new Set());
+    map.get(day).add(time);
+  }
+
+  // собираем текст
+  const parts = [];
+  for (const [day, timesSet] of map) {
+    const times = Array.from(timesSet).sort((a, b) => a.localeCompare(b));
+    parts.push(`${day}:\n${times.join(', ')}`);
+  }
+
+  return `НОВЫЕ СЛОТЫ ЛУЖНИКИ!\n${parts.join('\n\n')}\n\n${URL}`;
+}
+
 async function main() {
   const order = shuffle(PROXY_LIST);
   if (ALLOW_DIRECT) order.push(null);
@@ -209,20 +232,16 @@ async function main() {
       const freshKeys = keys.filter(k => !knownSet.has(k));
 
       if (freshKeys.length) {
-        // обновляем базу
+        // обновляем базу (храним всё, что видим сейчас)
         const newAll = Array.from(new Set([...known, ...keys])).sort();
         fs.writeFileSync(DATA_FILE, JSON.stringify(newAll, null, 2));
 
-        // в уведомлении — только список НОВЫХ времен (уникальных)
-        const freshTimes = Array.from(new Set(
-          freshKeys.map(k => k.split('|').pop().trim())
-        )).sort((a, b) => a.localeCompare(b));
-
-        const text = `НОВЫЕ СЛОТЫ ЛУЖНИКИ!\n${freshTimes.join('\n')}\n\n${URL}`;
+        // строим удобное сообщение с группировкой по дню
+        const text = buildMessageFromFreshKeys(freshKeys);
 
         if (bot && CHAT_ID) {
           await bot.sendMessage(CHAT_ID, text);
-          console.log('✓ Отправлено в Telegram:', freshTimes);
+          console.log('✓ Отправлено в Telegram. Новые ключи:', freshKeys.length);
         } else {
           console.log(text);
           console.warn('! TG_BOT_TOKEN/CHAT_ID не заданы — сообщение в консоль.');
