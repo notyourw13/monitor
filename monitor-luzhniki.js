@@ -1,6 +1,5 @@
 // monitor-luzhniki.js
 // Лужники: монитор НОВЫХ времен (и новых дней) + ротация прокси + Telegram
-// Сообщение = только список НОВЫХ времен (уникально, без цен/кортов)
 
 import { chromium } from 'playwright';
 import fs from 'fs';
@@ -15,7 +14,7 @@ const PROXY_LIST = (process.env.PROXY_LIST || '')
   .map(s => s.trim())
   .filter(Boolean);
 
-// Разрешить попробовать без прокси (например, если раннер в РФ)
+// Разрешить попробовать без прокси (если раннер/сервер в нужном регионе)
 const ALLOW_DIRECT = (process.env.ALLOW_DIRECT || '0') === '1';
 
 // === Telegram ===
@@ -40,19 +39,7 @@ function ua(i = 0) {
   ];
   return uas[i % uas.length];
 }
-function isVisible(node) {
-  if (!node) return false;
-  const style = window.getComputedStyle(node);
-  const rect = node.getBoundingClientRect?.();
-  const display = style?.display !== 'none';
-  const visibility = style?.visibility !== 'hidden';
-  const opacity = parseFloat(style?.opacity || '1') > 0.01;
-  const hasSize = rect ? (rect.width > 0 && rect.height > 0) : true;
-  const inDoc = document.contains(node);
-  return display && visibility && opacity && hasSize && inDoc && node.offsetParent !== null;
-}
 
-// === Браузер обёртки ===
 async function withBrowser(proxy, i, fn) {
   const launchOpts = { headless: true };
   if (proxy) {
@@ -67,6 +54,14 @@ async function withBrowser(proxy, i, fn) {
   });
   try {
     const page = await context.newPage();
+
+    // Блокируем тяжёлые ресурсы (ускорение)
+    await page.route('**/*', route => {
+      const type = route.request().resourceType();
+      if (['image', 'font', 'media', 'stylesheet'].includes(type)) return route.abort();
+      route.continue();
+    });
+
     const res = await fn(page);
     await browser.close();
     return res;
@@ -76,40 +71,47 @@ async function withBrowser(proxy, i, fn) {
   }
 }
 
+// Быстрый «пинг» прокси: сначала HTTP, затем HTTPS
 async function quickProbe(proxy, i) {
   return await withBrowser(proxy, i, async (page) => {
-    await page.goto('https://httpbin.org/ip', { timeout: 8000, waitUntil: 'domcontentloaded' });
+    // 1) HTTP — 3с
+    await page.goto('http://httpbin.org/ip', { timeout: 3000, waitUntil: 'domcontentloaded' });
+    // 2) HTTPS — 6с (важно, т.к. цель HTTPS)
+    await page.goto('https://example.com', { timeout: 6000, waitUntil: 'domcontentloaded' });
     return true;
   });
 }
 
-// === Извлечение СТРОГО "день|время" только из видимых элементов ===
+// Извлекаем ТОЛЬКО "день | HH:MM" из ВИДИМЫХ элементов
 async function extractDayTimeKeys(frameOrPage) {
-  // Ждём успокоения и появления видимых HH:MM
   await frameOrPage.waitForLoadState?.('networkidle').catch(() => {});
   await frameOrPage.waitForFunction(() => {
     const re = /\b([01]\d|2[0-3]):[0-5]\d\b/;
-    return Array.from(document.querySelectorAll('button, a, div, span'))
-      .some(el => (el.textContent || '').match(re) && (function isVisible(n){
-        if (!n) return false;
-        const s = getComputedStyle(n);
-        const r = n.getBoundingClientRect();
-        return s.display!=='none' && s.visibility!=='hidden' && parseFloat(s.opacity||'1')>0.01 &&
-               r.width>0 && r.height>0 && document.contains(n) && n.offsetParent!==null;
-      })(el));
-  }, { timeout: 60_000 });
-
-  const dayTimeKeys = await frameOrPage.$$eval('button, a, div, span', (els) => {
-    const timeRe = /\b([01]\d|2[0-3]):[0-5]\d\b/;
-    function isVisible(n){
+    const isVisible = (n) => {
       if (!n) return false;
       const s = getComputedStyle(n);
       const r = n.getBoundingClientRect();
-      return s.display!=='none' && s.visibility!=='hidden' && parseFloat(s.opacity||'1')>0.01 &&
-             r.width>0 && r.height>0 && document.contains(n) && n.offsetParent!==null;
-    }
-    function findDayAbove(el, maxDepth = 8) {
-      // Ищем подписи дат/дней рядом сверху
+      return s.display !== 'none' && s.visibility !== 'hidden' &&
+             parseFloat(s.opacity || '1') > 0.01 &&
+             r.width > 0 && r.height > 0 &&
+             document.contains(n) && n.offsetParent !== null;
+    };
+    return Array.from(document.querySelectorAll('button, a, div, span'))
+      .some(el => re.test(el.textContent || '') && isVisible(el));
+  }, { timeout: 60000 });
+
+  const keys = await frameOrPage.$$eval('button, a, div, span', (els) => {
+    const timeRe = /\b([01]\d|2[0-3]):[0-5]\d\b/;
+    const isVisible = (n) => {
+      if (!n) return false;
+      const s = getComputedStyle(n);
+      const r = n.getBoundingClientRect();
+      return s.display !== 'none' && s.visibility !== 'hidden' &&
+             parseFloat(s.opacity || '1') > 0.01 &&
+             r.width > 0 && r.height > 0 &&
+             document.contains(n) && n.offsetParent !== null;
+    };
+    const findDayAbove = (el, maxDepth = 8) => {
       const dayRes = [
         /(?:Пн|Вт|Ср|Чт|Пт|Сб|Вс)\.?/i,
         /\b\d{1,2}\s*(?:янв|фев|мар|апр|мая|июн|июл|авг|сен|окт|ноя|дек)\b/i,
@@ -125,29 +127,28 @@ async function extractDayTimeKeys(frameOrPage) {
         p = p.parentElement;
       }
       return '';
-    }
+    };
 
     const set = new Set();
     for (const el of els) {
       const txt = el.textContent || '';
       const m = txt.match(timeRe);
       if (!m) continue;
-      if (!isVisible(el)) continue; // только видимые!
+      if (!isVisible(el)) continue;
       const t = m[0];
-
       const day = findDayAbove(el) || 'День?';
       set.add(`${day} | ${t}`);
     }
     return Array.from(set);
   });
 
-  return dayTimeKeys.sort();
+  return keys.sort();
 }
 
 async function tryOneProxy(proxy, i) {
   console.log(`▶ Пробуем прокси [${i + 1}] ${proxy || '(без прокси)'}`);
 
-  // 1) быстрый «пинг»
+  // быстрый «пинг» (иначе перепрыгиваем к следующему)
   try {
     if (proxy) await quickProbe(proxy, i);
     else if (!ALLOW_DIRECT) throw new Error('DIRECT запрещён (ALLOW_DIRECT=0)');
@@ -156,12 +157,12 @@ async function tryOneProxy(proxy, i) {
     throw e;
   }
 
-  // 2) основной заход
+  // основной заход
   return await withBrowser(proxy, i, async (page) => {
     console.log(`… Открываем цель: ${URL} через ${proxy || 'DIRECT'}`);
-    await page.goto(URL, { waitUntil: 'domcontentloaded', timeout: 25_000 });
+    await page.goto(URL, { waitUntil: 'domcontentloaded', timeout: 25000 });
 
-    // если всё в iframe — выберем подходящий
+    // если расписание в iframe — найдём его
     let target = page;
     const frames = page.frames();
     if (frames.length > 1) {
@@ -188,6 +189,8 @@ async function main() {
   const order = shuffle(PROXY_LIST);
   if (ALLOW_DIRECT) order.push(null);
 
+  console.log(`Найдено прокси в списке: ${PROXY_LIST.length}. Порядок попыток: ${order.length}.`);
+
   let lastErr = null;
   const MAX_ATTEMPTS = Math.min(order.length, 30) || (ALLOW_DIRECT ? 1 : 0);
 
@@ -196,28 +199,26 @@ async function main() {
     try {
       const keys = await tryOneProxy(proxy, i);
 
-      // known = массив ключей "День | HH:MM"
+      // known = массив "День | HH:MM"
       const known = fs.existsSync(DATA_FILE)
         ? JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'))
         : [];
       const knownSet = new Set(known);
 
+      // только новые ключи
       const freshKeys = keys.filter(k => !knownSet.has(k));
 
       if (freshKeys.length) {
-        // Обновляем "базу знаний"
+        // обновляем базу
         const newAll = Array.from(new Set([...known, ...keys])).sort();
         fs.writeFileSync(DATA_FILE, JSON.stringify(newAll, null, 2));
 
-        // Оставляем только ЧАСЫ:МИНУТЫ (в уникальном виде) — то, что тебе нужно
+        // в уведомлении — только список НОВЫХ времен (уникальных)
         const freshTimes = Array.from(new Set(
           freshKeys.map(k => k.split('|').pop().trim())
         )).sort((a, b) => a.localeCompare(b));
 
-        const text =
-          'НОВЫЕ СЛОТЫ ЛУЖНИКИ!\n' +
-          freshTimes.join('\n') +
-          '\n\n' + URL;
+        const text = `НОВЫЕ СЛОТЫ ЛУЖНИКИ!\n${freshTimes.join('\n')}\n\n${URL}`;
 
         if (bot && CHAT_ID) {
           await bot.sendMessage(CHAT_ID, text);
