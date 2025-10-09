@@ -2,12 +2,13 @@ name: Luzhniki Monitor
 
 on:
   schedule:
-    - cron: "*/10 * * * *"  # каждые 10 минут
-  workflow_dispatch: {}
+    - cron: "*/10 * * * *"  # запуск каждые 10 минут
+  workflow_dispatch: {}      # можно запустить вручную
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -17,9 +18,10 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
-          npm install playwright node-fetch@2 proxy-chain socks-proxy-agent@6.2.1 https-proxy-agent@5 http-proxy-agent@5
+          npm install playwright node-fetch@2 proxy-chain \
+            socks-proxy-agent@6.2.1 http-proxy-agent@5 https-proxy-agent@5
 
       - name: Install Playwright browsers (Chromium)
         run: npx playwright install --with-deps chromium
@@ -29,10 +31,6 @@ jobs:
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          # Список прокси в виде строк, разделённых переводом строки.
-          # Поддерживаются: http(s)://host:port, socks5://user:pass@host:port, http://user:pass@host:port
-          PROXY_LIST: ${{ secrets.PROXY_LIST }}
-          # Включаем режим "присылай всё":
-          SEND_ALL: '1'
-          # Подробные логи:
-          DEBUG: '1'
+          PROXY_LIST: ${{ secrets.PROXY_LIST }}   # сюда можно добавить список или оставить пустым
+          DEBUG: '1'                              # подробные логи в консоли Actions
+          SEND_ALL: '1'                           # шлём все найденные сло_
