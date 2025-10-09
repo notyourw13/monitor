@@ -202,4 +202,46 @@ async function main() {
         : [];
       const knownSet = new Set(known);
 
-      const freshKeys
+      const freshKeys = keys.filter(k => !knownSet.has(k));
+
+      if (freshKeys.length) {
+        // Обновляем "базу знаний"
+        const newAll = Array.from(new Set([...known, ...keys])).sort();
+        fs.writeFileSync(DATA_FILE, JSON.stringify(newAll, null, 2));
+
+        // Оставляем только ЧАСЫ:МИНУТЫ (в уникальном виде) — то, что тебе нужно
+        const freshTimes = Array.from(new Set(
+          freshKeys.map(k => k.split('|').pop().trim())
+        )).sort((a, b) => a.localeCompare(b));
+
+        const text =
+          'НОВЫЕ СЛОТЫ ЛУЖНИКИ!\n' +
+          freshTimes.join('\n') +
+          '\n\n' + URL;
+
+        if (bot && CHAT_ID) {
+          await bot.sendMessage(CHAT_ID, text);
+          console.log('✓ Отправлено в Telegram:', freshTimes);
+        } else {
+          console.log(text);
+          console.warn('! TG_BOT_TOKEN/CHAT_ID не заданы — сообщение в консоль.');
+        }
+      } else {
+        console.log('Нет новых времен/дней — молчу.');
+      }
+      return; // успех — выходим
+    } catch (e) {
+      lastErr = e;
+      console.warn(`⚠ Ошибка на прокси ${order[i] || 'DIRECT'}: ${e?.message || e}`);
+      await new Promise(r => setTimeout(r, 1200));
+      continue;
+    }
+  }
+
+  throw lastErr || new Error('Не удалось открыть сайт ни через один прокси');
+}
+
+main().catch(err => {
+  console.error('Фатальная ошибка:', err);
+  process.exit(1);
+});
