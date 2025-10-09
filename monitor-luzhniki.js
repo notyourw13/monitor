@@ -2,7 +2,7 @@
 import { chromium } from 'playwright';
 import fetch from 'node-fetch';
 
-// --- Совместимый импорт CommonJS модулей ---
+// CJS-модули корректно через default-импорт:
 import httpProxyAgentPkg from 'http-proxy-agent';
 const { HttpProxyAgent } = httpProxyAgentPkg;
 
@@ -12,18 +12,17 @@ const { HttpsProxyAgent } = httpsProxyAgentPkg;
 import socksProxyAgentPkg from 'socks-proxy-agent';
 const { SocksProxyAgent } = socksProxyAgentPkg;
 
-// --- Константы и утилиты ---
+import proxyChainPkg from 'proxy-chain';
+const { anonymizeProxy, closeAnonymizedProxy } = proxyChainPkg;
+
+// --- Константы ---
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const PROXY_LIST = process.env.PROXY_LIST || '';
 const TARGET_URL = 'https://tennis.luzhniki.ru/#courts';
 const LOG = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
 
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
-
-// --- Разбор строки прокси ---
+// --- Утилиты ---
 function parseProxy(line) {
   const m = line.trim().match(/^(socks5|http|https):\/\/(?:(.+?):(.*?)@)?([^:\/]+):(\d+)$/i);
   if (!m) return null;
@@ -38,7 +37,6 @@ function parseProxy(line) {
   };
 }
 
-// --- Проверка прокси через HTTPS-запрос ---
 async function quickProbe(p) {
   const testUrl = 'https://api.ipify.org?format=json';
   let agent;
@@ -49,7 +47,6 @@ async function quickProbe(p) {
   } else {
     agent = new HttpsProxyAgent(`http://${p.username ? `${encodeURIComponent(p.username)}:${encodeURIComponent(p.password)}@` : ''}${p.host}:${p.port}`);
   }
-
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 6000);
   try {
@@ -64,52 +61,81 @@ async function quickProbe(p) {
   }
 }
 
-// --- Telegram уведомление ---
 async function notify(text) {
   if (!TG_BOT_TOKEN || !TG_CHAT_ID) {
     LOG('TG env not set; skip notify');
     return;
   }
   const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
-  const body = { chat_id: TG_CHAT_ID, text, disable_web_page_preview: true };
   try {
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ chat_id: TG_CHAT_ID, text, disable_web_page_preview: true }),
     });
-    if (!res.ok) {
-      const t = await res.text();
-      LOG('Telegram send error:', res.status, t);
-    }
+    if (!res.ok) LOG('Telegram send error:', res.status, await res.text());
   } catch (e) {
     LOG('Telegram send failed:', e.message || String(e));
   }
 }
 
-// --- Запуск браузера через прокси ---
-async function withBrowser(proxyObj, fn) {
-  const proxyForPW = {
+// Создаём пригодный для Playwright URL прокси.
+// Если SOCKS5 без/с авторизацией — поднимем локальный HTTP-прокси через proxy-chain.
+async function toPlaywrightProxy(proxyObj) {
+  // Playwright Chromium: поддерживает HTTP/HTTPS proxy с auth, SOCKS5 — без auth.
+  const isSocksWithAuth = proxyObj.scheme === 'socks5' && proxyObj.username;
+  if (isSocksWithAuth) {
+    const upstream = `socks5://${encodeURIComponent(proxyObj.username)}:${encodeURIComponent(proxyObj.password)}@${proxyObj.host}:${proxyObj.port}`;
+    const localHttp = await anonymizeProxy(upstream); // вернёт что-то вроде http://127.0.0.1:XXXXX
+    return { server: localHttp, _anonymized: localHttp }; // запомним для закрытия
+  }
+  // SOCKS5 без auth — Chromium не умеет auth, но без auth обычно ок. Всё равно надёжнее HTTP.
+  if (proxyObj.scheme === 'socks5') {
+    // завернём его тоже в локальный HTTP без auth, чтобы было стабильно
+    const upstream = `socks5://${proxyObj.host}:${proxyObj.port}`;
+    const localHttp = await anonymizeProxy(upstream);
+    return { server: localHttp, _anonymized: localHttp };
+  }
+  // HTTP/HTTPS
+  let auth = '';
+  if (proxyObj.username) auth = `${encodeURIComponent(proxyObj.username)}:${encodeURIComponent(proxyObj.password)}@`;
+  const server = `${proxyObj.scheme}://${auth}${proxyObj.host}:${proxyObj.port}`;
+  // Для Playwright прокси указывается без auth в URL, а логин/пароль отдельными полями
+  const pw = {
     server: `${proxyObj.scheme}://${proxyObj.host}:${proxyObj.port}`,
   };
-  if (proxyObj.username) proxyForPW.username = proxyObj.username;
-  if (proxyObj.password) proxyForPW.password = proxyObj.password;
+  if (proxyObj.username) {
+    pw.username = proxyObj.username;
+    pw.password = proxyObj.password;
+  }
+  return pw;
+}
+
+async function withBrowser(proxyObj, fn) {
+  // Преобразуем прокси в совместимый для Playwright формат
+  const pwProxy = await toPlaywrightProxy(proxyObj);
 
   const browser = await chromium.launch({
     headless: true,
-    proxy: proxyForPW,
+    proxy: pwProxy,
     timeout: 30000,
   });
+
   try {
     const ctx = await browser.newContext({ javaScriptEnabled: true });
     const page = await ctx.newPage();
-    return await fn(page);
+    const res = await fn(page);
+    await ctx.close();
+    return res;
   } finally {
     await browser.close();
+    // Если поднимали локальный анонимный прокси — закрываем
+    if (pwProxy._anonymized) {
+      try { await closeAnonymizedProxy(pwProxy._anonymized, true); } catch {}
+    }
   }
 }
 
-// --- Основное действие ---
 async function scrapeLuzhniki(proxyObj) {
   LOG('Открываем', TARGET_URL);
   return await withBrowser(proxyObj, async (page) => {
@@ -120,9 +146,7 @@ async function scrapeLuzhniki(proxyObj) {
 
 async function main() {
   const list = PROXY_LIST.split('\n').map(s => s.trim()).filter(Boolean);
-  if (list.length === 0) {
-    throw new Error('PROXY_LIST пуст. Помести туда строку вида socks5://user:pass@host:port');
-  }
+  if (list.length === 0) throw new Error('PROXY_LIST пуст. Помести туда строку вида socks5://user:pass@host:port');
 
   const first = parseProxy(list[0]);
   if (!first) throw new Error('Неверный формат первой строки PROXY_LIST');
