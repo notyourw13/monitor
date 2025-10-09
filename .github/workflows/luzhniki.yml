@@ -2,7 +2,7 @@ name: Luzhniki Monitor
 
 on:
   schedule:
-    - cron: "*/10 * * * *"  # каждые 10 минут
+    - cron: "*/10 * * * *"
   workflow_dispatch:
   push:
     branches: [ "main" ]
@@ -24,10 +24,15 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
+          # cache убрали, т.к. нет lock-файла
 
       - name: Install deps (ci if lockfile, otherwise i)
-        run: npm ci || npm i
+        run: |
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ] || [ -f yarn.lock ]; then
+            npm ci
+          else
+            npm i
+          fi
 
       - name: Install Playwright Chromium + deps
         run: npx playwright install --with-deps chromium
