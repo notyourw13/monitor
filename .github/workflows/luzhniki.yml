@@ -3,7 +3,7 @@ name: Luzhniki Monitor
 on:
   schedule:
     - cron: "*/10 * * * *"   # каждые 10 минут
-  workflow_dispatch: {}       # возможность запустить вручную
+  workflow_dispatch: {}
 
 jobs:
   run:
@@ -17,11 +17,14 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           npm install playwright node-fetch@2 proxy-chain socks-proxy-agent@6.2.1 https-proxy-agent@5 http-proxy-agent@5
 
-      - name: Run monitor script
+      - name: Install Playwright browsers (Chromium)
+        run: npx playwright install --with-deps chromium
+
+      - name: Run monitor
         run: node monitor-luzhniki.js
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
