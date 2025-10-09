@@ -1,22 +1,30 @@
 // monitor-luzhniki.js
 import { chromium } from 'playwright';
 import fetch from 'node-fetch';
-import { SocksProxyAgent } from 'socks-proxy-agent';
-import { HttpsProxyAgent } from 'https-proxy-agent';
-import { HttpProxyAgent } from 'http-proxy-agent';
 
+// --- Совместимый импорт CommonJS модулей ---
+import httpProxyAgentPkg from 'http-proxy-agent';
+const { HttpProxyAgent } = httpProxyAgentPkg;
+
+import httpsProxyAgentPkg from 'https-proxy-agent';
+const { HttpsProxyAgent } = httpsProxyAgentPkg;
+
+import socksProxyAgentPkg from 'socks-proxy-agent';
+const { SocksProxyAgent } = socksProxyAgentPkg;
+
+// --- Константы и утилиты ---
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const PROXY_LIST = process.env.PROXY_LIST || '';
-
 const TARGET_URL = 'https://tennis.luzhniki.ru/#courts';
 const LOG = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
 
-// Разбор строки прокси в объект для Playwright и для ping-пробы
+// --- Разбор строки прокси ---
 function parseProxy(line) {
-  // ожидаем: scheme://user:pass@host:port  или scheme://host:port
   const m = line.trim().match(/^(socks5|http|https):\/\/(?:(.+?):(.*?)@)?([^:\/]+):(\d+)$/i);
   if (!m) return null;
   const [, scheme, user, pass, host, port] = m;
@@ -30,15 +38,15 @@ function parseProxy(line) {
   };
 }
 
-// Быстрая проверка прокси HTTPS-запросом
+// --- Проверка прокси через HTTPS-запрос ---
 async function quickProbe(p) {
-  const testUrl = 'https://api.ipify.org?format=json'; // HTTPS, чтобы проверить туннель действительно работает
+  const testUrl = 'https://api.ipify.org?format=json';
   let agent;
   if (p.scheme === 'socks5') {
     agent = new SocksProxyAgent(`socks5://${p.username ? `${encodeURIComponent(p.username)}:${encodeURIComponent(p.password)}@` : ''}${p.host}:${p.port}`);
   } else if (p.scheme === 'http') {
     agent = new HttpProxyAgent(`http://${p.username ? `${encodeURIComponent(p.username)}:${encodeURIComponent(p.password)}@` : ''}${p.host}:${p.port}`);
-  } else { // https
+  } else {
     agent = new HttpsProxyAgent(`http://${p.username ? `${encodeURIComponent(p.username)}:${encodeURIComponent(p.password)}@` : ''}${p.host}:${p.port}`);
   }
 
@@ -56,18 +64,14 @@ async function quickProbe(p) {
   }
 }
 
-// Отправка в Telegram
+// --- Telegram уведомление ---
 async function notify(text) {
   if (!TG_BOT_TOKEN || !TG_CHAT_ID) {
     LOG('TG env not set; skip notify');
     return;
   }
   const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
-  const body = {
-    chat_id: TG_CHAT_ID,
-    text,
-    disable_web_page_preview: true,
-  };
+  const body = { chat_id: TG_CHAT_ID, text, disable_web_page_preview: true };
   try {
     const res = await fetch(url, {
       method: 'POST',
@@ -83,6 +87,7 @@ async function notify(text) {
   }
 }
 
+// --- Запуск браузера через прокси ---
 async function withBrowser(proxyObj, fn) {
   const proxyForPW = {
     server: `${proxyObj.scheme}://${proxyObj.host}:${proxyObj.port}`,
@@ -96,10 +101,7 @@ async function withBrowser(proxyObj, fn) {
     timeout: 30000,
   });
   try {
-    const ctx = await browser.newContext({
-      // Иногда помогает для прокси: отключить застарелые сервисы
-      javaScriptEnabled: true,
-    });
+    const ctx = await browser.newContext({ javaScriptEnabled: true });
     const page = await ctx.newPage();
     return await fn(page);
   } finally {
@@ -107,12 +109,11 @@ async function withBrowser(proxyObj, fn) {
   }
 }
 
-// Здесь просто проверяем доступность страницы через конкретный прокси
+// --- Основное действие ---
 async function scrapeLuzhniki(proxyObj) {
   LOG('Открываем', TARGET_URL);
   return await withBrowser(proxyObj, async (page) => {
     await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 25000 });
-    // Ничего не парсим — цель сейчас убедиться, что соединение проходит
     return true;
   });
 }
@@ -123,24 +124,20 @@ async function main() {
     throw new Error('PROXY_LIST пуст. Помести туда строку вида socks5://user:pass@host:port');
   }
 
-  // Берём только первую строку (у тебя сейчас одна купленная)
   const first = parseProxy(list[0]);
   if (!first) throw new Error('Неверный формат первой строки PROXY_LIST');
 
   LOG('Используем прокси:', `${first.scheme}://${first.host}:${first.port}${first.username ? ' (with auth)' : ''}`);
 
-  // Шаг 1. Быстрый ping через fetch
   const probe = await quickProbe(first);
   if (!probe.ok) {
     const msg = `Проба прокси не удалась: ${probe.error}`;
     LOG(msg);
     await notify(`❌ Прокси не прошёл проверку.\n${msg}`);
-    // Упасть, чтобы раннер был красным — удобнее замечать
     throw new Error(msg);
   }
   LOG('Прокси отвечает. Внешний IP:', probe.ip);
 
-  // Шаг 2. Пробуем открыть Лужники через Playwright
   try {
     await scrapeLuzhniki(first);
     LOG('Страница открыта через прокси успешно.');
