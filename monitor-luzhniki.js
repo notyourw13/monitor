@@ -1,5 +1,6 @@
 // monitor-luzhniki.js
-// Монитор слотов Лужники: Playwright + Telegram + ротация прокси
+// Лужники: монитор НОВЫХ времен (и новых дней) + ротация прокси + Telegram
+// Сообщение = только список НОВЫХ времен (уникально, без цен/кортов)
 
 import { chromium } from 'playwright';
 import fs from 'fs';
@@ -8,13 +9,13 @@ import TelegramBot from 'node-telegram-bot-api';
 const URL = 'https://tennis.luzhniki.ru/#courts';
 const DATA_FILE = './known-slots.json';
 
-// === Прокси: список из env (по одному на строке / через запятую) ===
+// === Прокси (по одному на строке / через запятую) ===
 const PROXY_LIST = (process.env.PROXY_LIST || '')
   .split(/[\n,]+/)
   .map(s => s.trim())
   .filter(Boolean);
 
-// Можно разрешить «пробовать без прокси» в самом конце (например, на VPS в РФ):
+// Разрешить попробовать без прокси (например, если раннер в РФ)
 const ALLOW_DIRECT = (process.env.ALLOW_DIRECT || '0') === '1';
 
 // === Telegram ===
@@ -31,7 +32,6 @@ function shuffle(a) {
   }
   return arr;
 }
-
 function ua(i = 0) {
   const uas = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36',
@@ -40,11 +40,22 @@ function ua(i = 0) {
   ];
   return uas[i % uas.length];
 }
+function isVisible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  const rect = node.getBoundingClientRect?.();
+  const display = style?.display !== 'none';
+  const visibility = style?.visibility !== 'hidden';
+  const opacity = parseFloat(style?.opacity || '1') > 0.01;
+  const hasSize = rect ? (rect.width > 0 && rect.height > 0) : true;
+  const inDoc = document.contains(node);
+  return display && visibility && opacity && hasSize && inDoc && node.offsetParent !== null;
+}
 
+// === Браузер обёртки ===
 async function withBrowser(proxy, i, fn) {
   const launchOpts = { headless: true };
   if (proxy) {
-    // поддерживаем и HTTP(S), и SOCKS5
     launchOpts.proxy = { server: proxy };
     launchOpts.args = [`--proxy-server=${proxy}`];
   }
@@ -66,32 +77,48 @@ async function withBrowser(proxy, i, fn) {
 }
 
 async function quickProbe(proxy, i) {
-  // Быстрый «пинг» прокси: грузим лёгкую страницу с коротким таймаутом
   return await withBrowser(proxy, i, async (page) => {
     await page.goto('https://httpbin.org/ip', { timeout: 8000, waitUntil: 'domcontentloaded' });
-    // Если нужно, можно считать JSON: const js = await page.textContent('pre');
     return true;
   });
 }
 
-async function extractSlots(frameOrPage) {
-  // ждём, пока появится хотя бы одно время HH:MM
+// === Извлечение СТРОГО "день|время" только из видимых элементов ===
+async function extractDayTimeKeys(frameOrPage) {
+  // Ждём успокоения и появления видимых HH:MM
   await frameOrPage.waitForLoadState?.('networkidle').catch(() => {});
   await frameOrPage.waitForFunction(() => {
     const re = /\b([01]\d|2[0-3]):[0-5]\d\b/;
     return Array.from(document.querySelectorAll('button, a, div, span'))
-      .some(el => re.test(el.textContent || ''));
+      .some(el => (el.textContent || '').match(re) && (function isVisible(n){
+        if (!n) return false;
+        const s = getComputedStyle(n);
+        const r = n.getBoundingClientRect();
+        return s.display!=='none' && s.visibility!=='hidden' && parseFloat(s.opacity||'1')>0.01 &&
+               r.width>0 && r.height>0 && document.contains(n) && n.offsetParent!==null;
+      })(el));
   }, { timeout: 60_000 });
 
-  const keys = await frameOrPage.$$eval('button, a, div, span', (els) => {
+  const dayTimeKeys = await frameOrPage.$$eval('button, a, div, span', (els) => {
     const timeRe = /\b([01]\d|2[0-3]):[0-5]\d\b/;
-    const results = new Set();
-
-    function findAbove(el, regexes, maxDepth = 6) {
+    function isVisible(n){
+      if (!n) return false;
+      const s = getComputedStyle(n);
+      const r = n.getBoundingClientRect();
+      return s.display!=='none' && s.visibility!=='hidden' && parseFloat(s.opacity||'1')>0.01 &&
+             r.width>0 && r.height>0 && document.contains(n) && n.offsetParent!==null;
+    }
+    function findDayAbove(el, maxDepth = 8) {
+      // Ищем подписи дат/дней рядом сверху
+      const dayRes = [
+        /(?:Пн|Вт|Ср|Чт|Пт|Сб|Вс)\.?/i,
+        /\b\d{1,2}\s*(?:янв|фев|мар|апр|мая|июн|июл|авг|сен|окт|ноя|дек)\b/i,
+        /\b\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?\b/,
+      ];
       let p = el;
       for (let i = 0; i < maxDepth && p; i++) {
-        const txt = (p.textContent || '').replace(/\s+/g, ' ').trim();
-        for (const re of regexes) {
+        const txt = (p.textContent || '').replace(/\s+/g,' ').trim();
+        for (const re of dayRes) {
           const m = txt.match(re);
           if (m) return m[0];
         }
@@ -100,55 +127,41 @@ async function extractSlots(frameOrPage) {
       return '';
     }
 
+    const set = new Set();
     for (const el of els) {
       const txt = el.textContent || '';
-      const t = txt.match(timeRe)?.[0];
-      if (!t) continue;
+      const m = txt.match(timeRe);
+      if (!m) continue;
+      if (!isVisible(el)) continue; // только видимые!
+      const t = m[0];
 
-      const day = findAbove(el, [
-        /(?:Пн|Вт|Ср|Чт|Пт|Сб|Вс)[^0-9\n]{0,6}\d{1,2}(?:[.\s]?(?:янв|фев|мар|апр|мая|июн|июл|авг|сен|окт|ноя|дек|[01]?\d))?/i,
-        /\b\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?\b/,
-        /\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b/i
-      ]) || 'День?';
-
-      const foundCourt = findAbove(el, [
-        /корт[^\d]{0,3}(\d{1,2})/i,
-        /court[^\d]{0,3}(\d{1,2})/i
-      ]);
-      const court = (foundCourt == null ? '' : foundCourt);
-
-      const courtLabel = court
-        ? (court.toLowerCase().startsWith('court') || court.toLowerCase().startsWith('корт')
-           ? court.replace(/\s+/g, ' ').trim()
-           : `Корт ${court}`)
-        : 'Корт?';
-
-      results.add([String(day).trim(), String(courtLabel).trim(), t].join(' | '));
+      const day = findDayAbove(el) || 'День?';
+      set.add(`${day} | ${t}`);
     }
-    return Array.from(results);
+    return Array.from(set);
   });
 
-  return keys.sort();
+  return dayTimeKeys.sort();
 }
 
 async function tryOneProxy(proxy, i) {
   console.log(`▶ Пробуем прокси [${i + 1}] ${proxy || '(без прокси)'}`);
 
-  // 1) быстрый «пинг» прокси (чтобы не тратить 60–90с на мёртвые)
+  // 1) быстрый «пинг»
   try {
     if (proxy) await quickProbe(proxy, i);
     else if (!ALLOW_DIRECT) throw new Error('DIRECT запрещён (ALLOW_DIRECT=0)');
   } catch (e) {
-    console.warn(`✗ Прокси отклонён на "пинге": ${proxy || 'DIRECT'} — ${e?.message || e}`);
+    console.warn(`✗ Отклонён на пинге: ${proxy || 'DIRECT'} — ${e?.message || e}`);
     throw e;
   }
 
-  // 2) основной заход на сайт
+  // 2) основной заход
   return await withBrowser(proxy, i, async (page) => {
     console.log(`… Открываем цель: ${URL} через ${proxy || 'DIRECT'}`);
     await page.goto(URL, { waitUntil: 'domcontentloaded', timeout: 25_000 });
 
-    // если расписание внутри iframe — найдём его
+    // если всё в iframe — выберем подходящий
     let target = page;
     const frames = page.frames();
     if (frames.length > 1) {
@@ -166,59 +179,27 @@ async function tryOneProxy(proxy, i) {
       }
     }
 
-    const slots = await extractSlots(target);
-    return slots;
+    const keys = await extractDayTimeKeys(target);
+    return keys;
   });
 }
 
 async function main() {
   const order = shuffle(PROXY_LIST);
-  if (ALLOW_DIRECT) order.push(null); // в самом конце — попробовать без прокси
-
-  console.log(`Найдено прокси в списке: ${PROXY_LIST.length}. Порядок попыток: ${order.length}.`);
+  if (ALLOW_DIRECT) order.push(null);
 
   let lastErr = null;
-  // ограничим общее число попыток, чтобы job не висел бесконечно
   const MAX_ATTEMPTS = Math.min(order.length, 30) || (ALLOW_DIRECT ? 1 : 0);
 
   for (let i = 0; i < MAX_ATTEMPTS; i++) {
     const proxy = order[i];
     try {
-      const slots = await tryOneProxy(proxy, i);
+      const keys = await tryOneProxy(proxy, i);
 
+      // known = массив ключей "День | HH:MM"
       const known = fs.existsSync(DATA_FILE)
         ? JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'))
         : [];
       const knownSet = new Set(known);
-      const fresh = slots.filter(k => !knownSet.has(k));
 
-      if (fresh.length) {
-        fs.writeFileSync(DATA_FILE, JSON.stringify(slots, null, 2));
-        const msg = `Новые слоты/дни на Лужниках:\n\n${fresh.join('\n')}\n\n${URL}`;
-        if (bot && CHAT_ID) {
-          await bot.sendMessage(CHAT_ID, msg);
-          console.log('✓ Отправлено в Telegram:', fresh.length, 'шт.');
-        } else {
-          console.log(msg);
-          console.warn('! TG_BOT_TOKEN/CHAT_ID не заданы — сообщение выведено в консоль.');
-        }
-      } else {
-        console.log('Нет новых слотов.');
-      }
-      return; // успех — выходим
-    } catch (e) {
-      lastErr = e;
-      console.warn(`⚠ Ошибка на прокси ${order[i] || 'DIRECT'}: ${e?.message || e}`);
-      // маленькая пауза между попытками, чтобы не долбить подряд
-      await new Promise(r => setTimeout(r, 1500));
-      continue;
-    }
-  }
-
-  throw lastErr || new Error('Не удалось открыть сайт ни через один прокси');
-}
-
-main().catch(err => {
-  console.error('Фатальная ошибка:', err);
-  process.exit(1);
-});
+      const freshKeys
