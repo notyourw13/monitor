@@ -1,19 +1,31 @@
 name: Luzhniki Monitor
+
 on:
   schedule:
-    - cron: "*/10 * * * *"   # РєР°Р¶РґС‹Рµ 10 РјРёРЅСѓС‚
+    - cron: "*/10 * * * *"   # каждые 10 минут
   workflow_dispatch: {}
+
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - run: npm ci || npm i
-      - run: npx playwright install --with-deps chromium
-      - run: node monitor-luzhniki.js
+
+      - name: Install dependencies
+        run: npm ci || npm i
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run monitor script
+        run: node monitor-luzhniki.js
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          PROXY_LIST: ${{ secrets.PROXY_LIST }}
