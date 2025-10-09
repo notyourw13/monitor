@@ -2,7 +2,7 @@ name: Luzhniki Monitor
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # каждые 10 минут
+    - cron: "*/10 * * * *"  # каждые 10 минут
   workflow_dispatch: {}
 
 jobs:
@@ -29,4 +29,10 @@ jobs:
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          # Список прокси в виде строк, разделённых переводом строки.
+          # Поддерживаются: http(s)://host:port, socks5://user:pass@host:port, http://user:pass@host:port
           PROXY_LIST: ${{ secrets.PROXY_LIST }}
+          # Включаем режим "присылай всё":
+          SEND_ALL: '1'
+          # Подробные логи:
+          DEBUG: '1'
