@@ -18,13 +18,13 @@ jobs:
 
     steps:
       - name: Checkout
-      uses: actions/checkout@v4
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm'
+          cache: npm
 
       - name: Install deps (ci if lockfile, otherwise i)
         run: npm ci || npm i
@@ -35,10 +35,9 @@ jobs:
       - name: Run monitor
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
-          # Прокси: единственный SOCKS5 с auth; можно также PROXY_LIST (через запятую)
-          PROXY_URL:    ${{ secrets.PROXY_URL }}
-          PROXY_LIST:   ${{ secrets.PROXY_LIST }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          PROXY_LIST: ${{ secrets.PROXY_LIST }}
         run: node monitor-luzhniki.js
 
       - name: Upload artifacts (screenshots/HTML) on fail or success
