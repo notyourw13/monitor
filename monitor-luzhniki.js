@@ -1,183 +1,217 @@
-// 1) Навигация по «мастеру» + обход дней и сбор слотов
-async function scrapeWizard(page) {
-  // ждём первый экран с карточками
-  await page.waitForLoadState('domcontentloaded', { timeout: 60_000 });
+// --- Luzhniki monitor ---
+// Работает в GitHub Actions. Проходит весь wizard:
+// "Аренда крытых кортов" → "Продолжить" → обходит дни → собирает слоты.
+// Использует SOCKS5 с авторизацией через proxy-chain (локальный HTTP-мост).
 
-  // иногда текст матчится не строго, поэтому берём contains
+import fs from 'fs';
+import { chromium, devices } from 'playwright';
+import proxyChain from 'proxy-chain';
+import fetch from 'node-fetch';
+import { SocksProxyAgent } from 'socks-proxy-agent';
+import TelegramBot from 'node-telegram-bot-api';
+
+const URL = 'https://tennis.luzhniki.ru/#courts';
+const DESKTOP = devices['Desktop Chrome'];
+const LOGFILE = `run-${Date.now()}.log`;
+
+// ----- логирование -----
+function log(...args) {
+  const line = `${new Date().toISOString()} ${args.join(' ')}`;
+  console.log(line);
+  try { fs.appendFileSync(LOGFILE, line + '\n'); } catch {}
+}
+
+// ----- env helpers -----
+function env(name, fallback) {
+  return (process.env[name] ?? fallback ?? '').toString().trim();
+}
+function pickFromList(listStr) {
+  if (!listStr) return null;
+  const items = listStr.split(/[, \n\r]+/).map(s => s.trim()).filter(Boolean);
+  if (!items.length) return null;
+  return items[Math.floor(Math.random() * items.length)];
+}
+
+// ----- подготовка прокси -----
+async function prepareBrowserProxy() {
+  const raw = env('PROXY_URL') || pickFromList(env('PROXY_LIST'));
+  if (!raw) throw new Error('PROXY_URL/PROXY_LIST пуст');
+
+  if (/^socks5:/i.test(raw)) {
+    log('Проверяем SOCKS5 upstream:', maskCreds(raw));
+    try {
+      const agent = new SocksProxyAgent(raw);
+      const r = await fetch('https://ifconfig.me', { agent, timeout: 10_000 });
+      if (!r.ok) throw new Error(`status ${r.status}`);
+      const ip = await r.text();
+      log('SOCKS5 работает, IP:', ip);
+    } catch (e) {
+      throw new Error('SOCKS5 upstream не отвечает: ' + e.message);
+    }
+    const httpBridge = await proxyChain.anonymizeProxy(raw);
+    log('Создан локальный HTTP-мост:', httpBridge);
+    return { server: httpBridge, close: () => proxyChain.closeAnonymizedProxy(httpBridge, true) };
+  }
+
+  if (/^https?:\/\//i.test(raw)) {
+    log('HTTP(S) прокси задан:', maskCreds(raw));
+    return { server: raw, close: async () => {} };
+  }
+
+  throw new Error('Неизвестный формат PROXY_URL');
+}
+
+function maskCreds(u) {
+  try {
+    const url = new URL(u);
+    if (url.username || url.password) {
+      url.username = '***';
+      url.password = '***';
+    }
+    return url.toString();
+  } catch { return u.replace(/\/\/[^@]+@/, '//***:***@'); }
+}
+
+// ----- Telegram -----
+async function sendTelegram(text) {
+  const token = env('TG_BOT_TOKEN');
+  const chat = env('TG_CHAT_ID');
+  if (!token || !chat) {
+    log('TG creds missing; skipping send');
+    return;
+  }
+  const bot = new TelegramBot(token);
+  await bot.sendMessage(chat, text, { disable_web_page_preview: true });
+}
+
+// ----- навигация и парсинг -----
+async function gotoWithRetries(page, url, attempts = 3) {
+  let last;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      await page.goto(url, { waitUntil: 'load', timeout: 90_000 });
+      await page.waitForSelector('text=Аренда крытых кортов', { timeout: 30_000 });
+      return;
+    } catch (e) {
+      last = e;
+      log(`[goto retry ${i}] ${e.message}`);
+      await page.waitForTimeout(5_000);
+    }
+  }
+  throw last;
+}
+
+async function dumpArtifacts(page, tag='fail') {
+  try { await page.screenshot({ path: `art-${tag}.png`, fullPage: true }); } catch {}
+  try { await fs.promises.writeFile(`art-${tag}.html`, await page.content()); } catch {}
+}
+
+// --- Основной обход wizard ---
+async function scrapeWizard(page) {
+  await page.waitForLoadState('domcontentloaded', { timeout: 60_000 });
   const card = page.locator('xpath=//*[contains(normalize-space(.),"Аренда крытых кортов")]').first();
   await card.waitFor({ state: 'visible', timeout: 30_000 });
   await card.click();
 
-  // кнопка «Продолжить»
-  const continueBtn = page.locator('xpath=//button[contains(normalize-space(.),"Продолжить")]').first();
-  await continueBtn.waitFor({ state: 'visible', timeout: 30_000 });
-  await continueBtn.click();
+  const contBtn = page.locator('xpath=//button[contains(normalize-space(.),"Продолжить")]').first();
+  await contBtn.waitFor({ state: 'visible', timeout: 30_000 });
+  await contBtn.click();
 
-  // ждём появления календаря/разделов
-  // (на некоторых версиях сначала виден заголовок месяца, на некоторых — сразу «Утро/Вечер»)
-  await page.waitForTimeout(800);
-  await page.waitForSelector('xpath=//*[contains(normalize-space(.),"Утро") or contains(normalize-space(.),"Вечер") or contains(@class,"calendar")]', { timeout: 30_000 }).catch(()=>{});
+  await page.waitForTimeout(1000);
+  await page.waitForSelector('text=Утро,Вечер', { timeout: 30_000 }).catch(()=>{});
 
-  // найдём все «кнопки дней» — кнопки/элементы, чей видимый текст = 1–2 цифры
-  const dayLocs = await page.locator('xpath=//*[self::button or @role="button" or contains(@class,"day")][normalize-space(string()) and not(.//button)][string-length(normalize-space(string()))<=2]').all();
+  // ищем кнопки дней
+  const btns = await page.locator('xpath=//*[self::button or @role="button"][string-length(normalize-space(.))<=2 and string-length(normalize-space(.))>=1]').all();
   const days = [];
-  for (const loc of dayLocs) {
-    const t = (await loc.innerText().catch(()=> '')).trim();
-    if (/^\d{1,2}$/.test(t)) days.push(loc);
+  for (const b of btns) {
+    const t = (await b.innerText().catch(()=> '')).trim();
+    if (/^\d{1,2}$/.test(t)) days.push(b);
   }
+  if (days.length === 0 && btns.length) days.push(btns[0]);
 
-  // если ничего не нашли — попробуем хотя бы один видимый «button»
-  if (days.length === 0) {
-    const anyBtn = page.locator('button').first();
-    if (await anyBtn.isVisible().catch(()=>false)) days.push(anyBtn);
-  }
-
-  const out = []; // {date, times[]}
-  for (let i = 0; i < days.length; i++) {
-    const dBtn = days[i];
-
-    // вытащим метадату даты (если есть) до клика
-    const isoBefore = await getISODateFromButton(page, dBtn).catch(()=>null);
-
+  const out = [];
+  for (const dBtn of days) {
     await dBtn.scrollIntoViewIfNeeded().catch(()=>{});
-    await dBtn.click({ timeout: 5_000 }).catch(()=>{});
-    await page.waitForTimeout(500); // дебаунс после клика
+    await dBtn.click({ timeout: 5000 }).catch(()=>{});
+    await page.waitForTimeout(500);
 
-    // чипы времени — любые видимые «HH:MM»
-    const times = await page.$$eval('*', nodes =>
-      Array.from(nodes)
-        .map(n => (n.textContent || '').trim())
+    const times = await page.$$eval('*', n =>
+      Array.from(n)
+        .map(el => (el.textContent||'').trim())
         .filter(t => /^\d{1,2}:\d{2}$/.test(t))
-        .map(t => {
-          const m = t.match(/^(\d{1,2}):(\d{2})$/);
-          return m ? `${m[1].padStart(2,'0')}:${m[2]}` : t;
-        })
+        .map(t => t.padStart(5,'0'))
     );
-
-    const uniqTimes = Array.from(new Set(times)).sort();
-
-    // определим дату текущего выбранного дня:
-    // 1) aria-label/дата у активной кнопки
-    // 2) отрисованная «шапка»/выбранная дата в календаре
-    // 3) fallback: текущая дата в Мск
-    let iso = await getISODateFromActiveDay(page).catch(()=>null);
-    if (!iso) iso = isoBefore;
-    if (!iso) iso = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Moscow' })).toISOString().slice(0,10);
-
-    out.push({ date: iso, times: uniqTimes });
+    const uniq = Array.from(new Set(times)).sort();
+    const today = new Date().toISOString().slice(0,10);
+    out.push({ date: today, times: uniq });
   }
-
-  // агрегируем по дате (если один день встречается несколько раз)
-  const by = new Map();
-  for (const row of out) {
-    if (!by.has(row.date)) by.set(row.date, new Set());
-    for (const t of row.times) by.get(row.date).add(t);
-  }
-  const agg = Array.from(by.entries()).map(([date, set]) => ({ date, times: Array.from(set).sort() }));
-  return agg;
-}
-
-// Вспомогалки для извлечения выбранной даты
-async function getISODateFromButton(page, btn) {
-  // пытаемся достать из aria-label или data-* у самой кнопки
-  const handle = await btn.elementHandle();
-  if (!handle) return null;
-  const info = await page.evaluate(el => {
-    const a = el.getAttribute('aria-label') || '';
-    const d = el.getAttribute('data-date') || el.getAttribute('data-day') || '';
-    return { a, d, text: (el.textContent||'').trim() };
-  }, handle);
-  const isoFromAria = parseDateFromString(info.a);
-  if (isoFromAria) return isoFromAria;
-  const isoFromData = parseDateFromString(info.d);
-  if (isoFromData) return isoFromData;
-  return null;
-}
-
-async function getISODateFromActiveDay(page) {
-  // ищем «активный/выбранный» день по классам или aria-selected
-  const active = page.locator('xpath=//*[contains(@class,"active") or contains(@class,"selected") or @aria-selected="true"][normalize-space(string())]');
-  if (await active.first().isVisible().catch(()=>false)) {
-    const t = (await active.first().innerText().catch(()=> '')).trim();
-    const aria = await active.first().getAttribute('aria-label').catch(()=>null);
-    const data = await active.first().getAttribute('data-date').catch(()=>null);
-    return parseDateFromString(aria) || parseDateFromString(data) || tryBuildISOFromDayNumber(t);
-  }
-  // fallback: ищем подпись даты где-нибудь рядом (например, «Сб, 12 октября»)
-  const header = page.locator('xpath=//*[contains(@class,"date") or contains(@class,"selected-date") or contains(normalize-space(.)," октября") or contains(normalize-space(.)," ноября") or contains(normalize-space(.)," сентября")]').first();
-  if (await header.isVisible().catch(()=>false)) {
-    const s = (await header.innerText().catch(()=> '')).trim();
-    return parseDateFromString(s);
-  }
-  return null;
-}
-
-function parseDateFromString(s) {
-  if (!s) return null;
-  // пробуем парсить форматы типа «сб, 12 октября 2025», «12.10.2025», «2025-10-12»
-  s = s.trim().toLowerCase();
-  const iso = s.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
-  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
-
-  const dmy = s.match(/\b(\d{1,2})[.\s/-](\d{1,2})[.\s/-](\d{2,4})\b/);
-  if (dmy) {
-    const d = dmy[1].padStart(2,'0');
-    const m = dmy[2].padStart(2,'0');
-    const y = dmy[3].length === 2 ? ('20' + dmy[3]) : dmy[3];
-    return `${y}-${m}-${d}`;
-  }
-
-  const months = {
-    'январ':1,'феврал':2,'март':3,'апрел':4,'ма':5,'июн':6,'июл':7,'август':8,'сентябр':9,'октябр':10,'ноябр':11,'декабр':12
-  };
-  const m = Object.entries(months).find(([k]) => s.includes(k));
-  const day = s.match(/\b(\d{1,2})\b/);
-  const year = s.match(/\b(20\d{2})\b/);
-  if (m && day) {
-    const mm = String(m[1]).padStart(2,'0');
-    const dd = String(day[1]).padStart(2,'0');
-    const yy = year ? year[1] : String(new Date().getFullYear());
-    return `${yy}-${mm}-${dd}`;
-  }
-  return null;
-}
-
-function tryBuildISOFromDayNumber(txt) {
-  if (!/^\d{1,2}$/.test(txt)) return null;
-  // берём «сегодня» по Москве (если календарь показывает текущий месяц)
-  const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Moscow' }));
-  const yyyy = now.getFullYear();
-  const mm = String(now.getMonth()+1).padStart(2,'0');
-  const dd = String(Number(txt)).padStart(2,'0');
-  return `${yyyy}-${mm}-${dd}`;
-}
-
-// 2) Форматирование (совместимо с текущей рассылкой)
-function formatSlotsByDay(slots) {
-  if (!slots?.length) return `ТЕКУЩИЕ СЛОТЫ ЛУЖНИКИ\n\n(ничего не найдено)\n\nhttps://tennis.luzhniki.ru/#courts`;
-  const fmt = new Intl.DateTimeFormat('ru-RU', { weekday: 'short', day: '2-digit', month: 'numeric' });
-  let out = 'ТЕКУЩИЕ СЛОТЫ ЛУЖНИКИ\n';
-  for (const day of [...slots].sort((a,b)=>a.date.localeCompare(b.date))) {
-    const d = new Date(day.date + 'T00:00:00+03:00');
-    out += `\n${fmt.format(d)}:\n`;
-    for (const t of [...(day.times||[])].sort()) out += `  ${t}\n`;
-  }
-  out += `\nhttps://tennis.luzhniki.ru/#courts`;
   return out;
 }
 
-// 3) В основном потоке замени участок навигации/парсинга на это:
-  // ...
-  log('Открываем', URL);
-  await gotoWithRetries(page, URL, 3);
-
-  const slots = await scrapeWizard(page);
-  log('Найдено слотов:', JSON.stringify(slots));
-
-  if (!slots.length) {
-    await dumpArtifacts(page, 'empty'); // чтобы понять, почему пусто
+// ----- форматирование -----
+function formatSlotsByDay(slots) {
+  if (!slots?.length)
+    return `ТЕКУЩИЕ СЛОТЫ ЛУЖНИКИ\n\n(ничего не найдено)\n\n${URL}`;
+  const fmt = new Intl.DateTimeFormat('ru-RU', { weekday:'short', day:'2-digit', month:'numeric' });
+  let out = 'ТЕКУЩИЕ СЛОТЫ ЛУЖНИКИ\n';
+  for (const day of [...slots].sort((a,b)=>a.date.localeCompare(b.date))) {
+    const d = new Date(day.date+'T00:00:00+03:00');
+    out += `\n${fmt.format(d)}:\n`;
+    for (const t of [...(day.times||[])].sort()) out += `  ${t}\n`;
   }
+  out += `\n${URL}`;
+  return out;
+}
 
-  const text = formatSlotsByDay(slots);
-  await sendTelegram(text);
-  // ...
+// ----- main -----
+(async () => {
+  let bridge, browser, context;
+  const start = Date.now();
+
+  try {
+    const prepared = await prepareBrowserProxy();
+    bridge = prepared;
+
+    const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36';
+
+    browser = await chromium.launch({
+      headless: true,
+      ...DESKTOP,
+      args: ['--no-sandbox','--disable-dev-shm-usage','--disable-blink-features=AutomationControlled'],
+      timeout: 120_000,
+      proxy: { server: bridge.server }
+    });
+
+    context = await browser.newContext({
+      locale: 'ru-RU',
+      timezoneId: 'Europe/Moscow',
+      userAgent: ua
+    });
+    const page = await context.newPage();
+    page.on('console', msg => log('[page]', msg.type(), msg.text()));
+
+    log('Открываем', URL);
+    await gotoWithRetries(page, URL, 3);
+
+    const slots = await scrapeWizard(page);
+    log('Найдено слотов:', JSON.stringify(slots));
+    if (!slots.length) await dumpArtifacts(page, 'empty');
+
+    const text = formatSlotsByDay(slots);
+    await sendTelegram(text);
+    log('Отправлено в Telegram.');
+
+  } catch (e) {
+    log('Ошибка:', e.message || e);
+    try {
+      const pages = context?.pages?.() || [];
+      if (pages[0]) await dumpArtifacts(pages[0], 'error');
+    } catch {}
+    process.exitCode = 1;
+  } finally {
+    try { await context?.close(); } catch {}
+    try { await browser?.close(); } catch {}
+    try { await bridge?.close?.(); } catch {}
+    log('Время выполнения:', Math.round((Date.now()-start)/1000)+'s');
+  }
+})();
