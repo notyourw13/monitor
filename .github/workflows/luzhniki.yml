@@ -2,35 +2,46 @@ name: Luzhniki Monitor
 
 on:
   schedule:
-    - cron: "*/10 * * * *"  # запуск каждые 10 минут
-  workflow_dispatch: {}      # можно запустить вручную
+    - cron: "*/10 * * * *"  # каждые 10 минут
+  workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout
+      uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: 20
+          cache: 'npm'
 
-      - name: Install dependencies
-        run: |
-          npm install playwright node-fetch@2 proxy-chain \
-            socks-proxy-agent@6.2.1 http-proxy-agent@5 https-proxy-agent@5
+      - name: Install deps (ci if lockfile, otherwise i)
+        run: npm ci || npm i
 
-      - name: Install Playwright browsers (Chromium)
+      - name: Install Playwright Chromium + deps
         run: npx playwright install --with-deps chromium
 
       - name: Run monitor
-        run: node monitor-luzhniki.js
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          PROXY_LIST: ${{ secrets.PROXY_LIST }}   # сюда можно добавить список или оставить пустым
-          DEBUG: '1'                              # подробные логи в консоли Actions
-          SEND_ALL: '1'                           # шлём все найденные сло_
+          TG_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
+          # Прокси: единственный SOCKS5 с auth; можно также PROXY_LIST (через запятую)
+          PROXY_URL:    ${{ secrets.PROXY_URL }}
+          PROXY_LIST:   ${{ secrets.PROXY_LIST }}
+        run: node monitor-luzhniki.js
+
+      - name: Upload artifacts (screenshots/HTML) on fail or success
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: luzhniki-artifacts
+          path: |
+            art-*.png
+            art-*.html
+            run-*.log
+          if-no-files-found: ignore
