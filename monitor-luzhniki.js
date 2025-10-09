@@ -1,180 +1,272 @@
 // monitor-luzhniki.js
-import { chromium } from 'playwright';
-import fetch from 'node-fetch';
+// Режим проверки: присылаем ВСЕ найденные слоты (SEND_ALL=1).
+// Поддержка прокси: http/https, socks5 с авторизацией через proxy-chain (конвертация в локальный http).
 
-// CJS-модули корректно через default-импорт:
+import playwright from 'playwright';
+import fetchDefault from 'node-fetch';
+import proxyChainDefault from 'proxy-chain';
+
+// proxy-agent пакеты — только для "быстрой" проверки прокси через fetch
 import httpProxyAgentPkg from 'http-proxy-agent';
-const { HttpProxyAgent } = httpProxyAgentPkg;
-
 import httpsProxyAgentPkg from 'https-proxy-agent';
-const { HttpsProxyAgent } = httpsProxyAgentPkg;
-
 import socksProxyAgentPkg from 'socks-proxy-agent';
+
+const { chromium } = playwright;
+const fetch = fetchDefault;
+const proxyChain = proxyChainDefault;
+const { HttpProxyAgent } = httpProxyAgentPkg;
+const { HttpsProxyAgent } = httpsProxyAgentPkg;
 const { SocksProxyAgent } = socksProxyAgentPkg;
 
-import proxyChainPkg from 'proxy-chain';
-const { anonymizeProxy, closeAnonymizedProxy } = proxyChainPkg;
-
-// --- Константы ---
-const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
-const TG_CHAT_ID = process.env.TG_CHAT_ID;
-const PROXY_LIST = process.env.PROXY_LIST || '';
+// ==================== конфиг ====================
 const TARGET_URL = 'https://tennis.luzhniki.ru/#courts';
-const LOG = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
+const DEBUG = process.env.DEBUG === '1';
+const SEND_ALL = process.env.SEND_ALL === '1';
 
-// --- Утилиты ---
-function parseProxy(line) {
-  const m = line.trim().match(/^(socks5|http|https):\/\/(?:(.+?):(.*?)@)?([^:\/]+):(\d+)$/i);
-  if (!m) return null;
-  const [, scheme, user, pass, host, port] = m;
-  return {
-    raw: line.trim(),
-    scheme: scheme.toLowerCase(),
-    host,
-    port: Number(port),
-    username: user || undefined,
-    password: pass || undefined,
-  };
-}
+const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || '';
+const TG_CHAT_ID = process.env.TG_CHAT_ID || '';
 
-async function quickProbe(p) {
-  const testUrl = 'https://api.ipify.org?format=json';
-  let agent;
-  if (p.scheme === 'socks5') {
-    agent = new SocksProxyAgent(`socks5://${p.username ? `${encodeURIComponent(p.username)}:${encodeURIComponent(p.password)}@` : ''}${p.host}:${p.port}`);
-  } else if (p.scheme === 'http') {
-    agent = new HttpProxyAgent(`http://${p.username ? `${encodeURIComponent(p.username)}:${encodeURIComponent(p.password)}@` : ''}${p.host}:${p.port}`);
-  } else {
-    agent = new HttpsProxyAgent(`http://${p.username ? `${encodeURIComponent(p.username)}:${encodeURIComponent(p.password)}@` : ''}${p.host}:${p.port}`);
-  }
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 6000);
+const PROXY_LIST = (process.env.PROXY_LIST || '')
+  .split('\n')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+function log(...args) { console.log(...args); }
+function dlog(...args) { if (DEBUG) console.log(...args); }
+
+// ==================== утилиты ====================
+
+function maskCred(url) {
   try {
-    const res = await fetch(testUrl, { agent, signal: ctrl.signal });
-    clearTimeout(t);
-    if (!res.ok) throw new Error(`probe status ${res.status}`);
-    const js = await res.json();
-    return { ok: true, ip: js.ip };
-  } catch (e) {
-    clearTimeout(t);
-    return { ok: false, error: e.message || String(e) };
+    const u = new URL(url);
+    if (u.username || u.password) {
+      u.username = '***';
+      u.password = '***';
+    }
+    return u.toString();
+  } catch {
+    return url;
   }
 }
 
-async function notify(text) {
+function pickProxy() {
+  if (PROXY_LIST.length === 0) return null;
+  // Берём первый из списка (можно рандомизировать при желании)
+  return PROXY_LIST[0];
+}
+
+function agentFor(targetUrl, proxyUrl) {
+  // Агент для node-fetch проверки
+  const t = new URL(targetUrl);
+  const p = new URL(proxyUrl);
+  if (p.protocol.startsWith('socks')) {
+    return new SocksProxyAgent(proxyUrl);
+  }
+  if (t.protocol === 'http:') {
+    return new HttpProxyAgent(proxyUrl);
+  }
+  return new HttpsProxyAgent(proxyUrl);
+}
+
+async function quickProbe(proxyUrl) {
+  // Быстро проверяем, что через прокси вообще что-то ходит
+  const testUrl = 'https://httpbin.org/ip';
+  try {
+    const res = await fetch(testUrl, { agent: agentFor(testUrl, proxyUrl), timeout: 7000 });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    return { ok: true, ip: json.origin || JSON.stringify(json) };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message || e) };
+  }
+}
+
+async function sendToTelegram(text) {
   if (!TG_BOT_TOKEN || !TG_CHAT_ID) {
-    LOG('TG env not set; skip notify');
+    log('[WARN] TG_BOT_TOKEN/TG_CHAT_ID не заданы — сообщение не будет отправлено.');
     return;
   }
   const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ chat_id: TG_CHAT_ID, text, disable_web_page_preview: true }),
-    });
-    if (!res.ok) LOG('Telegram send error:', res.status, await res.text());
-  } catch (e) {
-    LOG('Telegram send failed:', e.message || String(e));
-  }
-}
-
-// Создаём пригодный для Playwright URL прокси.
-// Если SOCKS5 без/с авторизацией — поднимем локальный HTTP-прокси через proxy-chain.
-async function toPlaywrightProxy(proxyObj) {
-  // Playwright Chromium: поддерживает HTTP/HTTPS proxy с auth, SOCKS5 — без auth.
-  const isSocksWithAuth = proxyObj.scheme === 'socks5' && proxyObj.username;
-  if (isSocksWithAuth) {
-    const upstream = `socks5://${encodeURIComponent(proxyObj.username)}:${encodeURIComponent(proxyObj.password)}@${proxyObj.host}:${proxyObj.port}`;
-    const localHttp = await anonymizeProxy(upstream); // вернёт что-то вроде http://127.0.0.1:XXXXX
-    return { server: localHttp, _anonymized: localHttp }; // запомним для закрытия
-  }
-  // SOCKS5 без auth — Chromium не умеет auth, но без auth обычно ок. Всё равно надёжнее HTTP.
-  if (proxyObj.scheme === 'socks5') {
-    // завернём его тоже в локальный HTTP без auth, чтобы было стабильно
-    const upstream = `socks5://${proxyObj.host}:${proxyObj.port}`;
-    const localHttp = await anonymizeProxy(upstream);
-    return { server: localHttp, _anonymized: localHttp };
-  }
-  // HTTP/HTTPS
-  let auth = '';
-  if (proxyObj.username) auth = `${encodeURIComponent(proxyObj.username)}:${encodeURIComponent(proxyObj.password)}@`;
-  const server = `${proxyObj.scheme}://${auth}${proxyObj.host}:${proxyObj.port}`;
-  // Для Playwright прокси указывается без auth в URL, а логин/пароль отдельными полями
-  const pw = {
-    server: `${proxyObj.scheme}://${proxyObj.host}:${proxyObj.port}`,
+  const body = {
+    chat_id: TG_CHAT_ID,
+    text,
+    parse_mode: 'HTML',
+    disable_web_page_preview: true
   };
-  if (proxyObj.username) {
-    pw.username = proxyObj.username;
-    pw.password = proxyObj.password;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`Telegram sendMessage failed: ${res.status} ${t}`);
   }
-  return pw;
 }
 
-async function withBrowser(proxyObj, fn) {
-  // Преобразуем прокси в совместимый для Playwright формат
-  const pwProxy = await toPlaywrightProxy(proxyObj);
+// ==================== парсинг ====================
 
-  const browser = await chromium.launch({
-    headless: true,
-    proxy: pwProxy,
-    timeout: 30000,
-  });
+// Парсим по тексту: вытаскиваем сегменты по дням Пн..Вс и внутри ищем времена HH:MM
+function extractSlotsFromText(fullText) {
+  const dayTokens = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
+  const dayRegex = new RegExp(`\\b(${dayTokens.join('|')})\\b[^\n]*`, 'g');
+  const timeRegex = /\b(?:[01]?\d|2[0-3]):[0-5]\d\b/g;
 
+  // Разобьём текст по дням, сохраняя порядок
+  // Идея: найти индексы всех вхождений дня и вырезать блок до следующего дня
+  const indices = [];
+  let m;
+  while ((m = dayRegex.exec(fullText)) !== null) {
+    indices.push({ index: m.index, label: m[0] });
+  }
+
+  const result = {}; // { 'Пн ...': ['07:00','22:00'], ... }
+  if (indices.length === 0) {
+    // fallback: просто собрать все времена без привязки к дням
+    const allTimes = Array.from(fullText.matchAll(timeRegex)).map(x => x[0]);
+    if (allTimes.length > 0) {
+      result['Без указания дня'] = Array.from(new Set(allTimes)).sort();
+    }
+    return result;
+  }
+
+  for (let i = 0; i < indices.length; i++) {
+    const start = indices[i].index;
+    const end = (i + 1 < indices.length) ? indices[i + 1].index : fullText.length;
+    const chunk = fullText.slice(start, end);
+    const dayLine = (indices[i].label || '').trim();
+
+    const times = Array.from(chunk.matchAll(timeRegex)).map(x => x[0]);
+    if (times.length > 0) {
+      const key = dayLine; // можно сюда добавить дату, если она есть в dayLine
+      const uniqSorted = Array.from(new Set(times)).sort();
+      result[key] = uniqSorted;
+    }
+  }
+  return result;
+}
+
+async function scrapeLuzhniki(page) {
+  await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  // даём странице подтянуть динамику
+  await page.waitForTimeout(2000);
+
+  // тянем весь видимый текст страницы
+  const text = await page.evaluate(() => document.body?.innerText || '');
+  if (DEBUG) {
+    dlog(`[DEBUG] Длина текста страницы: ${text.length}`);
+  }
+  const byDay = extractSlotsFromText(text);
+
+  return byDay; // объект { 'Пн ...': ['07:00', '22:00'], ... }
+}
+
+function composeAllMessage(byDay) {
+  const lines = [];
+  lines.push('ТЕКУЩИЕ СЛОТЫ ЛУЖНИКИ!');
+  lines.push('');
+
+  const dayKeys = Object.keys(byDay);
+  if (dayKeys.length === 0) {
+    lines.push('Сейчас свободных слотов не вижу.');
+  } else {
+    for (const key of dayKeys) {
+      lines.push(`<b>${key}</b>`);
+      const times = byDay[key] || [];
+      if (times.length) {
+        lines.push(times.join('\n'));
+      } else {
+        lines.push('(времени не найдено)');
+      }
+      lines.push(''); // пустая строка между днями
+    }
+  }
+
+  lines.push('');
+  lines.push(TARGET_URL);
+  return lines.join('\n');
+}
+
+// ==================== основной поток ====================
+
+async function withBrowser(proxyToUse, fn) {
+  let browser;
+  let serverToClose = null;
   try {
-    const ctx = await browser.newContext({ javaScriptEnabled: true });
+    let playwrightProxy = undefined;
+
+    if (proxyToUse) {
+      // Если socks5 с авторизацией — Playwright не умеет, поэтому через proxy-chain
+      // Это сделает локальный "анонимный" http-прокси, который перенаправляет на исходный.
+      const anonymized = await proxyChain.anonymizeProxy(proxyToUse);
+      playwrightProxy = { server: anonymized };
+      serverToClose = anonymized; // для корректного закрытия ниже
+      dlog(`[DEBUG] Проксируем через локальный proxy-chain: ${maskCred(anonymized)}`);
+    }
+
+    browser = await chromium.launch({
+      headless: true,
+      proxy: playwrightProxy
+    });
+
+    const ctx = await browser.newContext();
     const page = await ctx.newPage();
     const res = await fn(page);
     await ctx.close();
-    return res;
-  } finally {
     await browser.close();
-    // Если поднимали локальный анонимный прокси — закрываем
-    if (pwProxy._anonymized) {
-      try { await closeAnonymizedProxy(pwProxy._anonymized, true); } catch {}
-    }
-  }
-}
 
-async function scrapeLuzhniki(proxyObj) {
-  LOG('Открываем', TARGET_URL);
-  return await withBrowser(proxyObj, async (page) => {
-    await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 25000 });
-    return true;
-  });
+    // proxy-chain под капотом поднимает локальный сервер; закрыть:
+    if (serverToClose) {
+      try { await proxyChain.closeAnonymizedProxy(serverToClose, true); } catch {}
+    }
+
+    return res;
+  } catch (e) {
+    if (browser) await browser.close().catch(() => {});
+    if (serverToClose) {
+      try { await proxyChain.closeAnonymizedProxy(serverToClose, true); } catch {}
+    }
+    throw e;
+  }
 }
 
 async function main() {
-  const list = PROXY_LIST.split('\n').map(s => s.trim()).filter(Boolean);
-  if (list.length === 0) throw new Error('PROXY_LIST пуст. Помести туда строку вида socks5://user:pass@host:port');
+  const ts = new Date().toISOString();
+  const proxy = pickProxy();
+  if (proxy) log(`[${ts}] Используем прокси: ${maskCred(proxy)}`);
+  else log(`[${ts}] Прокси не задан — пробуем без прокси`);
 
-  const first = parseProxy(list[0]);
-  if (!first) throw new Error('Неверный формат первой строки PROXY_LIST');
-
-  LOG('Используем прокси:', `${first.scheme}://${first.host}:${first.port}${first.username ? ' (with auth)' : ''}`);
-
-  const probe = await quickProbe(first);
-  if (!probe.ok) {
-    const msg = `Проба прокси не удалась: ${probe.error}`;
-    LOG(msg);
-    await notify(`❌ Прокси не прошёл проверку.\n${msg}`);
-    throw new Error(msg);
+  // Быстрая проверка прокси (если он есть)
+  if (proxy) {
+    const probe = await quickProbe(proxy);
+    if (probe.ok) {
+      log(`[${ts}] Прокси отвечает. Внешний IP: ${probe.ip}`);
+    } else {
+      log(`[${ts}] Внимание: быстрый пинг прокси не удался: ${probe.error}`);
+      // всё равно попробуем открыть страницу — иногда httpbin недоступен из конкретной сети
+    }
   }
-  LOG('Прокси отвечает. Внешний IP:', probe.ip);
 
   try {
-    await scrapeLuzhniki(first);
-    LOG('Страница открыта через прокси успешно.');
-    await notify('✅ Прокси ок. Страница Лужников открылась.');
+    const byDay = await withBrowser(proxy, async (page) => {
+      log(`[${new Date().toISOString()}] Открываем ${TARGET_URL}`);
+      const data = await scrapeLuzhniki(page);
+      dlog('[DEBUG] Результат парсинга:', JSON.stringify(data, null, 2));
+      return data;
+    });
+
+    // Всегда отправляем ВСЁ (режим SEND_ALL=1). На этот момент он у нас принудительно включён из workflow.
+    const msg = composeAllMessage(byDay);
+    await sendToTelegram(msg);
+    log(`[${new Date().toISOString()}] Сообщение отправлено (${Object.keys(byDay).length} дней).`);
   } catch (e) {
-    const err = e?.message || String(e);
-    LOG('Фатальная ошибка:', err);
-    await notify(`❌ Ошибка открытия Лужников через прокси:\n${err}`);
+    log(`[${new Date().toISOString()}] Завершено с ошибкой: ${e && e.message || e}`);
     throw e;
   }
 }
 
 main().catch(e => {
-  LOG('Завершено с ошибкой:', e?.message || String(e));
+  // пусть GitHub Actions пометит как failed
+  console.error('Фатальная ошибка:', e);
   process.exit(1);
 });
