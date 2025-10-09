@@ -1,25 +1,21 @@
 // monitor-luzhniki.js
-// Мониторинг слотов на сайте tennis.luzhniki.ru
-// Отправляет уведомления в Telegram о новых слотах
-// При DUMP_ALL=1 — присылает все слоты (режим проверки)
+// Мониторинг сайта tennis.luzhniki.ru — уведомления о слотах
+// При DUMP_ALL=1 бот присылает полный список слотов для проверки
 
-// -------------------------
-// Импорт библиотек
-// -------------------------
 import fs from 'fs';
 import { chromium } from 'playwright';
 import fetch from 'node-fetch';
 
 // -------------------------
-// Настройки окружения
+// Константы окружения
 // -------------------------
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const PROXY_LIST = (process.env.PROXY_LIST || '').split(/\r?\n/).filter(Boolean);
-const DUMP_ALL = process.env.DUMP_ALL === '1'; // режим отладки — шлёт все слоты
+const DUMP_ALL = process.env.DUMP_ALL === '1'; // режим проверки — шлёт все слоты
 
 // -------------------------
-// Вспомогательные функции
+// Утилиты
 // -------------------------
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -39,9 +35,8 @@ function log(msg) {
 }
 
 // -------------------------
-// Основная логика
+// Форматирование сообщений
 // -------------------------
-
 const DAY_SHORT = ['Вс','Пн','Вт','Ср','Чт','Пт','Сб'];
 
 function formatFullReport(slotsByDay) {
@@ -55,9 +50,9 @@ function formatFullReport(slotsByDay) {
     const day = DAY_SHORT[dt.getDay()];
     const dd  = String(dt.getDate()).padStart(2,'0');
     const mm  = String(dt.getMonth()+1).padStart(2,'0');
-    const human = `${day} ${dd}.${mm}`;
-    const ts = (d.times && d.times.length) ? d.times.join(', ') : '—';
-    lines.push(`${human}: ${ts}`);
+    const label = `${day} ${dd}.${mm}`;
+    const times = (d.times && d.times.length) ? d.times.join(', ') : '—';
+    lines.push(`${label}: ${times} (${d.times.length} слотов)`);
   }
   lines.push('', 'https://tennis.luzhniki.ru/#courts');
   return lines.join('\n');
@@ -78,6 +73,9 @@ function formatNewSlots(newSlots) {
   return lines.join('\n');
 }
 
+// -------------------------
+// Работа с браузером
+// -------------------------
 async function withBrowser(proxy, fn) {
   const browser = await chromium.launch({
     headless: true,
@@ -93,7 +91,11 @@ async function withBrowser(proxy, fn) {
 
 async function scrapeLuzhniki(page) {
   log('Открываем https://tennis.luzhniki.ru/#courts');
-  await page.goto('https://tennis.luzhniki.ru/#courts', { timeout: 60000, waitUntil: 'domcontentloaded' });
+  await page.goto('https://tennis.luzhniki.ru/#courts', {
+    timeout: 60000,
+    waitUntil: 'domcontentloaded'
+  });
+
   await page.waitForSelector('.react-calendar', { timeout: 10000 }).catch(() => {});
   await sleep(2000);
 
@@ -115,7 +117,7 @@ async function scrapeLuzhniki(page) {
 }
 
 // -------------------------
-// Основной цикл
+// Главная функция
 // -------------------------
 async function main() {
   let proxyToUse = null;
@@ -126,14 +128,12 @@ async function main() {
 
   const slots = await withBrowser(proxyToUse, scrapeLuzhniki);
 
-  // Читаем сохранённые слоты
   const saveFile = 'slots.json';
   let oldSlots = [];
   if (fs.existsSync(saveFile)) {
     oldSlots = JSON.parse(fs.readFileSync(saveFile, 'utf8'));
   }
 
-  // Группируем по дате
   const groupByDay = {};
   for (const s of slots) {
     const key = new Date(s.date).toDateString();
@@ -141,13 +141,12 @@ async function main() {
     groupByDay[key].times.push(...s.times);
   }
 
-  // Режим проверки — шлём всё
+  // 🔍 Режим проверки — шлём полный отчёт
   if (DUMP_ALL) {
     await sendTelegram(formatFullReport(groupByDay));
     return;
   }
 
-  // Определяем новые слоты
   const oldKeys = new Set(oldSlots.map(s => `${s.date}-${s.times.join(',')}`));
   const newOnes = slots.filter(s => !oldKeys.has(`${s.date}-${s.times.join(',')}`));
 
