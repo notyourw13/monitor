@@ -1,4 +1,4 @@
-// --- Luzhniki Monitor (strict slot selector + strong visibility) ---
+// --- Luzhniki Monitor (stable slot capture) ---
 import playwright from 'playwright';
 import fetch from 'node-fetch';
 import proxyChain from 'proxy-chain';
@@ -16,6 +16,10 @@ const TARGET_URL   = 'https://tennis.luzhniki.ru/';
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || '';
 const TG_CHAT_ID   = process.env.TG_CHAT_ID   || '';
 const PROXY_LIST   = (process.env.PROXY_LIST || '').trim();
+
+const SLOT_SEL =
+  '[class^="time-slot-module__slot___"],[class*="time-slot-module__slot___"],' +
+  '[class^="time-slot-module__slot__"],[class*="time-slot-module__slot__"]';
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
@@ -90,83 +94,10 @@ async function clickThroughWizard(page) {
   if (await cont.isVisible().catch(() => false)) await cont.click({ timeout: 5000 });
   else await page.locator('text=Продолжить').first().click({ timeout: 5000 }).catch(() => {});
   log('✅ Продолжить');
-  await page.waitForTimeout(600);
+  await page.waitForTimeout(400);
 }
 
-// ---------- helpers ----------
-async function nudgeScroll(page) {
-  await page.evaluate(() => {
-    window.scrollBy(0, Math.round(window.innerHeight * 0.5));
-    const els = [...document.querySelectorAll('*')];
-    for (const el of els) {
-      const cs = getComputedStyle(el);
-      if ((cs.overflowY === 'auto' || cs.overflowY === 'scroll') && el.scrollHeight > el.clientHeight) {
-        el.scrollTop = Math.min(el.scrollTop + 280, el.scrollHeight);
-      }
-    }
-  });
-  await page.waitForTimeout(150);
-}
-async function waitAnyTimeVisible(page, timeout = 4500) {
-  await page.waitForFunction(() => {
-    const re = /\b\d{1,2}:\d{2}\b/;
-    const nodes = [...document.querySelectorAll('[class*="time-slot-module__slot"]')];
-    const isVis = (el) => {
-      const cs = getComputedStyle(el);
-      if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
-      const rects = el.getClientRects?.(); if (!rects || rects.length === 0) return false;
-      const r = rects[0];
-      if (!(r.bottom > 0 && r.top < window.innerHeight && r.right > 0 && r.left < window.innerWidth)) return false;
-      if (el.closest('[aria-hidden="true"]')) return false;
-      return true;
-    };
-    for (const el of nodes) {
-      if (!isVis(el)) continue;
-      if (re.test(el.textContent || '')) return true;
-    }
-    return false;
-  }, { timeout }).catch(() => {});
-}
-
-// ---------- time extraction (STRICT) ----------
-async function collectTimes(page, dayLabel) {
-  await nudgeScroll(page);
-  await waitAnyTimeVisible(page, 5000);
-
-  const times = await page.evaluate(() => {
-    const acc = new Set();
-    const re = /\b(\d{1,2}):(\d{2})\b/g;
-    const isVis = (el) => {
-      const cs = getComputedStyle(el);
-      if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
-      const rects = el.getClientRects?.(); if (!rects || rects.length === 0) return false;
-      const r = rects[0];
-      if (!(r.bottom > 0 && r.top < window.innerHeight && r.right > 0 && r.left < window.innerWidth)) return false;
-      if (el.closest('[aria-hidden="true"]')) return false;
-      return true;
-    };
-
-    const SLOT_SEL =
-      '[class^="time-slot-module__slot___"],[class*="time-slot-module__slot___"],' +
-      '[class^="time-slot-module__slot__"],[class*="time-slot-module__slot__"]';
-
-    document.querySelectorAll(SLOT_SEL).forEach((el) => {
-      if (!isVis(el)) return;
-      const txt = (el.textContent || '');
-      let m; while ((m = re.exec(txt))) {
-        const hh = m[1].padStart(2, '0'); const mm = m[2];
-        acc.add(`${hh}:${mm}`);
-      }
-    });
-
-    return Array.from(acc).sort((a, b) => a.localeCompare(b));
-  });
-
-  if (times.length === 0) { await dump(page, `day-${dayLabel}`); }
-  return times;
-}
-
-// ---------- day buttons ----------
+// ---------- days ----------
 async function findDayButtons(page) {
   const divs = page.locator('button div:nth-child(2)');
   const cnt = await divs.count().catch(() => 0);
@@ -175,50 +106,74 @@ async function findDayButtons(page) {
     const d = divs.nth(i);
     const txt = (await d.innerText().catch(() => '')).trim();
     if (!/^\d{1,2}$/.test(txt)) continue;
-
     const btn = d.locator('xpath=ancestor::button[1]');
-    const ok = await btn.isVisible().catch(() => false);
-    const enabled = await btn.isEnabled().catch(() => false);
-    if (!(ok && enabled)) continue;
-
-    const bb = await btn.boundingBox().catch(() => null);
+    if (!(await btn.isVisible().catch(()=>false)) || !(await btn.isEnabled().catch(()=>false))) continue;
+    const bb = await btn.boundingBox().catch(()=>null);
     if (!bb) continue;
-
-    const cls = (await btn.getAttribute('class').catch(() => '')) || '';
-    if (/Disabled|disabled/.test(cls)) continue;
-
     list.push({ label: txt, btn, x: bb.x });
   }
-  list.sort((a, b) => a.x - b.x);
+  list.sort((a,b)=>a.x-b.x);
   return list;
 }
 async function getSelectedDayLabel(page) {
   const sel = page.locator('button[class*="Selected"] div:nth-child(2)').first();
-  const t = (await sel.innerText().catch(() => '')).trim();
+  const t = (await sel.innerText().catch(()=> '')).trim();
   return /^\d{1,2}$/.test(t) ? t : '';
+}
+
+// ---------- collect times (simplified & robust) ----------
+async function collectTimes(page, dayLabel) {
+  // ждём, когда список слотов вообще появится/перерисуется
+  await page.waitForSelector(SLOT_SEL, { state:'visible', timeout: 5000 }).catch(()=>{});
+  await page.waitForTimeout(150);
+
+  // немного прокрутим, чтобы и «Вечер» догрузился
+  await page.evaluate(()=>{
+    window.scrollBy(0, Math.round(window.innerHeight*0.4));
+  }).catch(()=>{});
+  await page.waitForTimeout(100);
+
+  const times = await page.evaluate((SLOT_SEL_ARG) => {
+    const acc = new Set();
+    const re = /\b(\d{1,2}):(\d{2})\b/;
+    document.querySelectorAll(SLOT_SEL_ARG).forEach(el => {
+      // Playwright помечает видимые элементы корректно — используем offsetParent
+      if (!el.offsetParent) return;
+      const t = (el.textContent || '').trim();
+      const m = t.match(re);
+      if (m) {
+        const hh = m[1].padStart(2,'0');
+        acc.add(`${hh}:${m[2]}`);
+      }
+    });
+    return Array.from(acc).sort((a,b)=>a.localeCompare(b));
+  }, SLOT_SEL);
+
+  if (times.length === 0) await dump(page, `day-${dayLabel}`);
+  return times;
 }
 
 // ---------- scrape ----------
 async function scrapeAll(page) {
   await clickThroughWizard(page);
   const days = await findDayButtons(page);
-  log('📅 Кандидаты:', days.map(d => d.label).join(', '));
+  log('📅 Кандидаты:', days.map(d=>d.label).join(', '));
 
   const result = {};
   for (const d of days) {
-    await d.btn.scrollIntoViewIfNeeded().catch(() => {});
-    await d.btn.click({ timeout: 1500 }).catch(() => {});
+    await d.btn.scrollIntoViewIfNeeded().catch(()=>{});
+    await d.btn.click({ timeout:1500 }).catch(()=>{});
     await page.waitForTimeout(220);
 
-    const after = await getSelectedDayLabel(page);
-    if (after !== d.label) continue; // реально не выбрался — пропускаем
+    const selected = await getSelectedDayLabel(page);
+    if (selected !== d.label) continue;
 
-    // на всякий случай «шевельнём» секции
-    for (const name of ['Утро', 'Вечер']) {
+    // прожмём переключатели, если есть — это триггерит дорисовку
+    for (const name of ['Утро','Вечер']) {
       const sw = page.locator(`text=${name}`).first();
-      if (await sw.isVisible().catch(() => false)) {
-        await sw.click({ timeout: 350 }).catch(() => {});
-        await page.waitForTimeout(80);
+      if (await sw.isVisible().catch(()=>false)) {
+        await sw.click({ timeout: 350 }).catch(()=>{});
+        await page.waitForTimeout(60);
       }
     }
 
@@ -240,7 +195,7 @@ async function main() {
   }
 
   const { browser, server } = await launchBrowserWithProxy(chosen);
-  const ctx = await browser.newContext({ viewport: { width: 1280, height: 1600 } });
+  const ctx = await browser.newContext({ viewport: { width: 1280, height: 1500 } });
   const page = await ctx.newPage();
 
   log('🌐 Открываем сайт:', TARGET_URL);
