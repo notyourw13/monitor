@@ -1,10 +1,11 @@
-// --- Luzhniki Monitor (days via button div:nth-child(2)) ---
+// --- Luzhniki Monitor (robust slots extraction, no day limit) ---
 import playwright from 'playwright';
 import fetch from 'node-fetch';
 import proxyChain from 'proxy-chain';
 import httpProxyAgentPkg from 'http-proxy-agent';
 import httpsProxyAgentPkg from 'https-proxy-agent';
 import socksProxyAgentPkg from 'socks-proxy-agent';
+import fs from 'fs/promises';
 
 const { chromium } = playwright;
 const { HttpProxyAgent }  = httpProxyAgentPkg;
@@ -25,13 +26,19 @@ async function testProxyReachable(u){const agent=buildFetchAgent(u);const c=new 
 
 // ---------- telegram ----------
 async function sendTelegram(text){
-  if(!TG_BOT_TOKEN||!TG_CHAT_ID){log('TG creds missing; printing message:\n'+text);return;}
+  if(!TG_BOT_TOKEN||!TG_CHAT_ID){log('TG creds missing; printing:\n'+text);return;}
   const r=await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`,{
     method:'POST',headers:{'content-type':'application/json'},
     body:JSON.stringify({chat_id:TG_CHAT_ID,text,disable_web_page_preview:true})
   });
   if(!r.ok){throw new Error('Telegram '+r.status+' '+await r.text().catch(()=>''));}
 }
+
+// ---------- artifacts ----------
+async function dump(page, tag){ try{
+  await fs.writeFile(`art-${tag}.html`, await page.content(), 'utf8');
+  await page.screenshot({ path:`art-${tag}.png`, fullPage:true });
+}catch{}}
 
 // ---------- browser ----------
 async function launchBrowserWithProxy(raw){
@@ -52,13 +59,27 @@ async function clickThroughWizard(page){
   else await page.locator('text=Продолжить').first().click({ timeout:5000 }).catch(()=>{});
   log('✅ Продолжить');
   await page.waitForTimeout(700);
+  await dump(page,'after-continue'); // одна контрольная точка
 }
 
-// ---------- times ----------
-async function collectTimes(page){
-  await page.waitForTimeout(200);
-  await page.evaluate(()=>window.scrollBy(0,Math.round(window.innerHeight*0.4)));
-  // дождёмся хотя бы одного HH:MM
+// ---------- utils ----------
+async function scrollAll(page){
+  // «разбудим» ленивые списки
+  await page.evaluate(()=>{
+    const els=[document.scrollingElement || document.documentElement, ...Array.from(document.querySelectorAll('*'))];
+    for(const el of els){
+      const style=getComputedStyle(el);
+      if(['auto','scroll'].includes(style.overflowY) && el.scrollHeight>el.clientHeight){
+        const step=Math.min(200, el.scrollHeight-el.clientHeight);
+        el.scrollTop+=step;
+      }
+    }
+    window.scrollBy(0, Math.round(window.innerHeight*0.5));
+  });
+}
+
+async function waitAnyTimeVisible(page, timeout=4000){
+  // ждём, пока появится хотя бы один HH:MM в целевых ul или в тексте
   await page.waitForFunction(()=>{
     const re=/^\s*\d{1,2}:\d{2}\s*$/;
     const q=(root)=>!!root&&!!Array.from(root.querySelectorAll(
@@ -68,17 +89,26 @@ async function collectTimes(page){
     return q(document.querySelector('ul:nth-child(2)'))||
            q(document.querySelector('ul:nth-child(4)'))||
            re.test(document.body?.innerText||'');
-  },{timeout:3500}).catch(()=>{});
+  },{timeout}).catch(()=>{});
+}
+
+async function collectTimes(page, dayLabel){
+  await scrollAll(page);
+  await waitAnyTimeVisible(page, 4500);
 
   const times = await page.evaluate(()=>{
     const acc=new Set(); const re=/^\s*(\d{1,2}):(\d{2})\s*$/;
     const pull=(root)=>{ if(!root)return;
-      root.querySelectorAll('[class^="time-slot-module__slot___"],[class*="time-slot-module__slot___"],[class^="time-slot-module__slot__"],[class*="time-slot-module__slot__"]').forEach(el=>{
+      root.querySelectorAll(
+        '[class^="time-slot-module__slot___"],[class*="time-slot-module__slot___"],' +
+        '[class^="time-slot-module__slot__"],[class*="time-slot-module__slot__"]'
+      ).forEach(el=>{
         const m=(el.textContent||'').trim().match(re); if(m) acc.add(m[1].padStart(2,'0')+':'+m[2]);
       });
     };
     pull(document.querySelector('ul:nth-child(2)'));
     pull(document.querySelector('ul:nth-child(4)'));
+    // fallback — весь документ
     if(acc.size===0){
       document.querySelectorAll('button,span,div,li').forEach(el=>{
         const m=(el.textContent||'').trim().match(re); if(m) acc.add(m[1].padStart(2,'0')+':'+m[2]);
@@ -87,56 +117,72 @@ async function collectTimes(page){
     return Array.from(acc).sort();
   });
 
+  if(times.length===0){
+    // сохраним артефакты по проблемным дням
+    try{
+      await dump(page, `day-${dayLabel}`);
+    }catch{}
+  }
   return times;
 }
 
-// ---------- main scrape ----------
-async function scrapeAll(page){
-  await clickThroughWizard(page);
-
-  // 1) найдём «кнопки-цифры» как второй див внутри кнопки
+// ---------- days finding ----------
+async function findDayButtons(page){
+  // у календарных кнопок цифра — во 2-м диве: button > div:nth-child(2)
   const numberDivs = page.locator('button div:nth-child(2)');
   const count = await numberDivs.count().catch(()=>0);
-
-  const dayButtons = [];
+  const buttons = [];
   for(let i=0;i<count;i++){
     const div = numberDivs.nth(i);
     const txt = (await div.innerText().catch(()=>''))?.trim();
     if(!/^\d{1,2}$/.test(txt)) continue;
-    // подняться к ближайшей кнопке
     const btn = div.locator('xpath=ancestor::button[1]');
-    if(await btn.isVisible().catch(()=>false)){
-      dayButtons.push({ label: txt, btn });
-    }
+    if(await btn.isVisible().catch(()=>false)) buttons.push({ label: txt, btn });
   }
-
-  // упорядочим слева-направо по x
-  const withPos = [];
-  for(const d of dayButtons){
-    const bb = await d.btn.boundingBox().catch(()=>null);
-    if(bb) withPos.push({ ...d, x: bb.x });
+  // упорядочим слева-направо
+  const withPos=[];
+  for(const d of buttons){
+    const bb=await d.btn.boundingBox().catch(()=>null);
+    if(bb) withPos.push({ ...d, x:bb.x });
   }
   withPos.sort((a,b)=>a.x-b.x);
+  return withPos;
+}
 
-  log('📅 Дни:', withPos.map(d=>d.label).join(', ')); // должно быть 10..17
+// ---------- scrape ----------
+async function scrapeAll(page){
+  await clickThroughWizard(page);
+
+  const days = await findDayButtons(page);
+  log('📅 Дни:', days.map(d=>d.label).join(', '));
 
   const result = {};
-  // пройдёмся по всем найденным (их немного)
-  for(const d of withPos){
+
+  // кликаем КАЖДЫЙ видимый день (чтобы не пропустить новый)
+  for(const d of days){
     await d.btn.scrollIntoViewIfNeeded().catch(()=>{});
     await d.btn.click({ timeout:1500 }).catch(()=>{});
-    await page.waitForTimeout(400);
-    const times = await collectTimes(page);
+    await page.waitForTimeout(350);
+
+    // переключатели «Утро/Вечер» если есть — щёлкнем оба
+    for(const txt of ['Утро','Вечер']){
+      const sw = page.locator(`text=${txt}`).first();
+      if(await sw.isVisible().catch(()=>false)){
+        await sw.click({ timeout:500 }).catch(()=>{});
+        await page.waitForTimeout(120);
+      }
+    }
+
+    const times = await collectTimes(page, d.label);
     if(times.length) result[d.label]=times;
   }
 
   return result;
 }
 
-// ---------- entry ----------
+// ---------- main ----------
 async function main(){
   const start=Date.now();
-
   let chosen=null;
   if(PROXY_LIST){
     for(const p of PROXY_LIST.split(/\r?\n/).map(parseProxyLine).filter(Boolean)){
