@@ -1,4 +1,4 @@
-// --- Luzhniki Monitor (robust slots extraction, no day limit) ---
+// --- Luzhniki Monitor (any HH:MM, scroll-aware, all visible days) ---
 import playwright from 'playwright';
 import fetch from 'node-fetch';
 import proxyChain from 'proxy-chain';
@@ -59,116 +59,103 @@ async function clickThroughWizard(page){
   else await page.locator('text=Продолжить').first().click({ timeout:5000 }).catch(()=>{});
   log('✅ Продолжить');
   await page.waitForTimeout(700);
-  await dump(page,'after-continue'); // одна контрольная точка
 }
 
-// ---------- utils ----------
-async function scrollAll(page){
-  // «разбудим» ленивые списки
+// ---------- helpers ----------
+async function nudgeScroll(page){
   await page.evaluate(()=>{
-    const els=[document.scrollingElement || document.documentElement, ...Array.from(document.querySelectorAll('*'))];
+    window.scrollBy(0, Math.round(window.innerHeight*0.5));
+    const els=[...document.querySelectorAll('*')];
     for(const el of els){
-      const style=getComputedStyle(el);
-      if(['auto','scroll'].includes(style.overflowY) && el.scrollHeight>el.clientHeight){
-        const step=Math.min(200, el.scrollHeight-el.clientHeight);
-        el.scrollTop+=step;
+      const cs=getComputedStyle(el);
+      if((cs.overflowY==='auto'||cs.overflowY==='scroll') && el.scrollHeight>el.clientHeight){
+        el.scrollTop = Math.min(el.scrollTop+300, el.scrollHeight);
       }
     }
-    window.scrollBy(0, Math.round(window.innerHeight*0.5));
   });
+  await page.waitForTimeout(250);
 }
 
-async function waitAnyTimeVisible(page, timeout=4000){
-  // ждём, пока появится хотя бы один HH:MM в целевых ul или в тексте
-  await page.waitForFunction(()=>{
-    const re=/^\s*\d{1,2}:\d{2}\s*$/;
-    const q=(root)=>!!root&&!!Array.from(root.querySelectorAll(
-      '[class^="time-slot-module__slot___"],[class*="time-slot-module__slot___"],' +
-      '[class^="time-slot-module__slot__"],[class*="time-slot-module__slot__"]'
-    )).find(el=>re.test((el.textContent||'').trim()));
-    return q(document.querySelector('ul:nth-child(2)'))||
-           q(document.querySelector('ul:nth-child(4)'))||
-           re.test(document.body?.innerText||'');
-  },{timeout}).catch(()=>{});
+// ждём появления любого HH:MM в DOM
+async function waitAnyTimeVisible(page, timeout=4500){
+  await page.waitForFunction(
+    () => /\b\d{1,2}:\d{2}\b/.test(document.body?.innerText||''),
+    { timeout }
+  ).catch(()=>{});
 }
 
+// ---------- time extraction (broad) ----------
 async function collectTimes(page, dayLabel){
-  await scrollAll(page);
-  await waitAnyTimeVisible(page, 4500);
+  await nudgeScroll(page);
+  await waitAnyTimeVisible(page, 5000);
 
   const times = await page.evaluate(()=>{
-    const acc=new Set(); const re=/^\s*(\d{1,2}):(\d{2})\s*$/;
-    const pull=(root)=>{ if(!root)return;
-      root.querySelectorAll(
-        '[class^="time-slot-module__slot___"],[class*="time-slot-module__slot___"],' +
-        '[class^="time-slot-module__slot__"],[class*="time-slot-module__slot__"]'
-      ).forEach(el=>{
-        const m=(el.textContent||'').trim().match(re); if(m) acc.add(m[1].padStart(2,'0')+':'+m[2]);
-      });
-    };
-    pull(document.querySelector('ul:nth-child(2)'));
-    pull(document.querySelector('ul:nth-child(4)'));
-    // fallback — весь документ
-    if(acc.size===0){
-      document.querySelectorAll('button,span,div,li').forEach(el=>{
-        const m=(el.textContent||'').trim().match(re); if(m) acc.add(m[1].padStart(2,'0')+':'+m[2]);
-      });
+    const acc=new Set();
+    const re=/\b(\d{1,2}):(\d{2})\b/g;
+
+    // 1) Все «слоты» по классам (CSS-модули)
+    document.querySelectorAll(
+      '[class^="time-slot-module__slot___"],[class*="time-slot-module__slot___"],' +
+      '[class^="time-slot-module__slot__"],[class*="time-slot-module__slot__"]'
+    ).forEach(el=>{
+      const txt=(el.textContent||'');
+      let m; while((m=re.exec(txt))){ acc.add(m[1].padStart(2,'0')+':'+m[2]); }
+    });
+
+    // 2) На всякий случай — ищем HH:MM вообще во всём расписании
+    // Ограничим поиск видимой областью (ускорение) — берём элементы в пределах viewport
+    const candidates=[...document.querySelectorAll('button,span,div,li,p')];
+    for(const el of candidates){
+      const rect=el.getBoundingClientRect?.();
+      if(rect && (rect.bottom<0 || rect.top>window.innerHeight)) continue;
+      const txt=(el.textContent||'');
+      let m; while((m=re.exec(txt))){ acc.add(m[1].padStart(2,'0')+':'+m[2]); }
     }
-    return Array.from(acc).sort();
+
+    return Array.from(acc).sort((a,b)=>a.localeCompare(b));
   });
 
-  if(times.length===0){
-    // сохраним артефакты по проблемным дням
-    try{
-      await dump(page, `day-${dayLabel}`);
-    }catch{}
-  }
+  if(times.length===0){ await dump(page, `day-${dayLabel}`); }
   return times;
 }
 
-// ---------- days finding ----------
+// ---------- day buttons ----------
 async function findDayButtons(page){
-  // у календарных кнопок цифра — во 2-м диве: button > div:nth-child(2)
-  const numberDivs = page.locator('button div:nth-child(2)');
-  const count = await numberDivs.count().catch(()=>0);
-  const buttons = [];
-  for(let i=0;i<count;i++){
-    const div = numberDivs.nth(i);
-    const txt = (await div.innerText().catch(()=>''))?.trim();
+  // цифра лежит в button > div:nth-child(2)
+  const divs = page.locator('button div:nth-child(2)');
+  const cnt = await divs.count().catch(()=>0);
+  const list=[];
+  for(let i=0;i<cnt;i++){
+    const d = divs.nth(i);
+    const txt = (await d.innerText().catch(()=>''))?.trim();
     if(!/^\d{1,2}$/.test(txt)) continue;
-    const btn = div.locator('xpath=ancestor::button[1]');
-    if(await btn.isVisible().catch(()=>false)) buttons.push({ label: txt, btn });
+    const btn = d.locator('xpath=ancestor::button[1]');
+    if(await btn.isVisible().catch(()=>false)){
+      const bb = await btn.boundingBox().catch(()=>null);
+      if(bb) list.push({ label: txt, btn, x: bb.x });
+    }
   }
-  // упорядочим слева-направо
-  const withPos=[];
-  for(const d of buttons){
-    const bb=await d.btn.boundingBox().catch(()=>null);
-    if(bb) withPos.push({ ...d, x:bb.x });
-  }
-  withPos.sort((a,b)=>a.x-b.x);
-  return withPos;
+  list.sort((a,b)=>a.x-b.x);
+  return list;
 }
 
 // ---------- scrape ----------
 async function scrapeAll(page){
   await clickThroughWizard(page);
-
   const days = await findDayButtons(page);
   log('📅 Дни:', days.map(d=>d.label).join(', '));
 
   const result = {};
-
-  // кликаем КАЖДЫЙ видимый день (чтобы не пропустить новый)
   for(const d of days){
     await d.btn.scrollIntoViewIfNeeded().catch(()=>{});
     await d.btn.click({ timeout:1500 }).catch(()=>{});
-    await page.waitForTimeout(350);
+    await page.waitForTimeout(300);
 
-    // переключатели «Утро/Вечер» если есть — щёлкнем оба
-    for(const txt of ['Утро','Вечер']){
-      const sw = page.locator(`text=${txt}`).first();
+    // щёлкнем переключатели, если есть (чтобы оба списка прогрузились)
+    for(const name of ['Утро','Вечер']){
+      const sw = page.locator(`text=${name}`).first();
       if(await sw.isVisible().catch(()=>false)){
-        await sw.click({ timeout:500 }).catch(()=>{});
+        await sw.click({ timeout:400 }).catch(()=>{});
         await page.waitForTimeout(120);
       }
     }
@@ -183,6 +170,7 @@ async function scrapeAll(page){
 // ---------- main ----------
 async function main(){
   const start=Date.now();
+
   let chosen=null;
   if(PROXY_LIST){
     for(const p of PROXY_LIST.split(/\r?\n/).map(parseProxyLine).filter(Boolean)){
@@ -204,7 +192,9 @@ async function main(){
   if(!keys.length){
     text+='(ничего не найдено)\n\n';
   }else{
-    for(const k of keys) text+=`📅 ${k}\n${all[k].join(', ')}\n\n`;
+    for(const k of keys){
+      text+=`📅 ${k}\n  ${all[k].join(', ')}\n\n`;
+    }
   }
   text+='https://tennis.luzhniki.ru/#courts';
 
