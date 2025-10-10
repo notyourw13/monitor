@@ -1,6 +1,6 @@
 // --- Luzhniki Monitor vFinal ---
-// Автоматически открывает сайт Лужники → Аренда теннисных кортов → Крытые → Продолжить → календарь
-// Собирает доступные часы (07:00, 22:00 и т.п.) по всем видимым дням и шлёт в Telegram
+// Открываем главную → «Аренда теннисных кортов» → «Аренда крытых кортов» → «Продолжить» → календарь.
+// Собираем доступные времена по всем видимым дням и шлём в Telegram.
 
 import playwright from 'playwright';
 import fetch from 'node-fetch';
@@ -18,9 +18,7 @@ const TARGET_URL = 'https://tennis.luzhniki.ru/';
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || '';
 const TG_CHAT_ID   = process.env.TG_CHAT_ID   || '';
 const PROXY_LIST   = (process.env.PROXY_LIST || '').trim();
-const DEBUG = process.env.DEBUG === '1';
 
-// simple logger
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
 // ---------- proxy utils ----------
@@ -68,11 +66,7 @@ async function sendTelegram(text) {
   const r = await fetch(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: TG_CHAT_ID,
-      text,
-      disable_web_page_preview: true,
-    }),
+    body: JSON.stringify({ chat_id: TG_CHAT_ID, text, disable_web_page_preview: true }),
   });
   if (!r.ok) {
     const body = await r.text().catch(() => '');
@@ -106,7 +100,7 @@ async function scrapeSlots(page) {
   await card.click({ timeout: 3000 });
   log('✅ Клик по карточке «Аренда крытых кортов»');
 
-  // ждём и нажимаем "Продолжить"
+  // ждём и нажимаем «Продолжить»
   const contBtn = page.locator('button:has-text("Продолжить")').first();
   if (await contBtn.isVisible().catch(() => false)) {
     await contBtn.click({ timeout: 5000 });
@@ -119,11 +113,10 @@ async function scrapeSlots(page) {
   }
 
   // ждём календарь
-  await page.waitForSelector('text=Октябрь, text=Ноябрь, text=Декабрь', { timeout: 20000 }).catch(() => {});
-  await page.waitForTimeout(2000);
+  await page.waitForTimeout(1500);
 
-  // кнопки-дни
-  const dayButtons = await page.locator('button:nth-child(n)').all();
+  // кнопки-дни (их много, фильтруем по «чистому числу»)
+  const dayButtons = await page.locator('button:nth-child(n), [role="button"]').all();
   log('📅 Найдено кнопок-дней:', dayButtons.length);
 
   const result = {};
@@ -138,39 +131,38 @@ async function scrapeSlots(page) {
     await b.click({ timeout: 3000 }).catch(() => {});
     await page.waitForTimeout(700);
 
-    // теперь ищем слоты времени
-    // теперь ищем слоты времени (устойчиво к CSS-модулям)
-await page.waitForTimeout(300);
-// чуть прокрутим, вдруг «Вечер» вне вьюпорта
-await page.evaluate(() => window.scrollBy(0, Math.round(window.innerHeight * 0.5)));
-await page.waitForTimeout(200);
+    // --- устойчивый сбор времён (CSS-модули + текстовый паттерн) ---
+    await page.waitForTimeout(300);
+    await page.evaluate(() => window.scrollBy(0, Math.round(window.innerHeight * 0.5)));
+    await page.waitForTimeout(200);
 
-const timesSet = new Set();
+    const timesSet = new Set();
 
-// 1) CSS-модуль со стабильным префиксом
-for (const sel of [
-  '[class^="time-slot-module__slot__"]',
-  '[class*="time-slot-module__slot__"]',
-]) {
-  const els = await page.locator(sel).all().catch(() => []);
-  for (const el of els) {
-    const txt = (await el.innerText().catch(() => '')).trim();
-    if (/^\d{1,2}:\d{2}$/.test(txt)) timesSet.add(txt.padStart(5, '0'));
+    // 1) Селекторы с префиксом CSS-модуля
+    for (const sel of [
+      '[class^="time-slot-module__slot__"]',
+      '[class*="time-slot-module__slot__"]',
+    ]) {
+      const els = await page.locator(sel).all().catch(() => []);
+      for (const el of els) {
+        const txt = (await el.innerText().catch(() => '')).trim();
+        if (/^\d{1,2}:\d{2}$/.test(txt)) timesSet.add(txt.padStart(5, '0'));
+      }
+    }
+
+    // 2) Любой элемент «HH:MM» на всякий пожарный
+    const textEls = await page.locator('text=/^\\s*\\d{1,2}:\\d{2}\\s*$/').all().catch(() => []);
+    for (const el of textEls) {
+      const txt = (await el.innerText().catch(() => '')).trim();
+      if (/^\d{1,2}:\d{2}$/.test(txt)) timesSet.add(txt.padStart(5, '0'));
+    }
+
+    const times = Array.from(timesSet).sort();
+    if (times.length) {
+      result[label] = times;
+      log(`⏰ День ${label}:`, times);
+    }
   }
-}
-
-// 2) На всякий случай – любой элемент, содержащий «HH:MM»
-const textEls = await page.locator('text=/^\\s*\\d{1,2}:\\d{2}\\s*$/').all().catch(() => []);
-for (const el of textEls) {
-  const txt = (await el.innerText().catch(() => '')).trim();
-  if (/^\d{1,2}:\d{2}$/.test(txt)) timesSet.add(txt.padStart(5, '0'));
-}
-
-const times = Array.from(timesSet).sort();
-if (times.length) {
-  result[label] = times;
-  log(`⏰ День ${label}:`, times);
-}
 
   return result;
 }
