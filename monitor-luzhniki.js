@@ -1,4 +1,4 @@
-// --- Luzhniki Monitor — stable multi-day scrape (methods 1+4+5+7) ---
+// --- Luzhniki Monitor — stable multi-day scrape (robust wizard + methods 1+4+5+7) ---
 import playwright from 'playwright';
 import fetch from 'node-fetch';
 import proxyChain from 'proxy-chain';
@@ -13,6 +13,7 @@ const { HttpsProxyAgent } = httpsProxyAgentPkg;
 const { SocksProxyAgent } = socksProxyAgentPkg;
 
 const TARGET_URL   = 'https://tennis.luzhniki.ru/';
+const COURTS_URL   = 'https://tennis.luzhniki.ru/#courts';
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || '';
 const TG_CHAT_ID   = process.env.TG_CHAT_ID   || '';
 const PROXY_LIST   = (process.env.PROXY_LIST || '').trim();
@@ -68,7 +69,7 @@ async function sendTelegram(text) {
   if (!r.ok) throw new Error('Telegram ' + r.status + ' ' + (await r.text().catch(()=>'')));
 }
 
-// ---------- artifacts (на случай отладки) ----------
+// ---------- artifacts (для отладки) ----------
 async function dump(page, tag) {
   try {
     await fs.writeFile(`art-${tag}.html`, await page.content(), 'utf8');
@@ -84,17 +85,63 @@ async function launchBrowserWithProxy(raw) {
   return { browser, server };
 }
 
-// ---------- wizard ----------
+// ---------- wizard (robust) ----------
 async function clickThroughWizard(page) {
-  await page.locator('text=Аренда теннисных кортов').first().click({ timeout: 20000 });
-  log('✅ Баннер');
-  await page.locator('text=Аренда крытых кортов').first().click({ timeout: 20000 });
-  log('✅ Крытые');
-  const cont = page.locator('button:has-text("Продолжить")').first();
-  if (await cont.isVisible().catch(() => false)) await cont.click({ timeout: 5000 });
-  else await page.locator('text=Продолжить').first().click({ timeout: 5000 }).catch(() => {});
-  log('✅ Продолжить');
-  await page.waitForTimeout(400);
+  // 1) Баннер (если виден)
+  const banner = page.locator('text=Аренда теннисных кортов').first();
+  if (await banner.isVisible().catch(()=>false)) {
+    await banner.click({ timeout: 20000 }).catch(()=>{});
+    log('✅ Баннер');
+    await page.waitForTimeout(300);
+  }
+
+  const deadline = Date.now() + 15000; // суммарно до ~15с на этап
+  while (Date.now() < deadline) {
+    // Уже в календаре?
+    const anyDay = page.locator('button div:nth-child(2)').filter({ hasText: /^\d{1,2}$/ }).first();
+    if (await anyDay.isVisible().catch(()=>false)) {
+      log('➡️ Уже на экране календаря');
+      break;
+    }
+
+    // 2) Карточка «Крытые» несколькими способами
+    const indoorByText = page.locator('text=/Аренда\\s+крытых\\s+кортов/i').first();
+    const indoorCard =
+      (await indoorByText.isVisible().catch(()=>false)) ? indoorByText :
+      page.locator('[class*="card"], [role="group"], [role="button"]').filter({ hasText: /Крыт/i }).first();
+
+    if (await indoorCard.isVisible().catch(()=>false)) {
+      const plus = indoorCard.locator('xpath=ancestor::*[self::div or self::section][1]//button[contains(.,"+")]').first();
+      if (await plus.isVisible().catch(()=>false)) {
+        await plus.click({ timeout: 2000 }).catch(()=>{});
+      } else {
+        await indoorCard.click({ timeout: 3000 }).catch(()=>{});
+      }
+      log('✅ Крытые');
+      await page.waitForTimeout(200);
+    }
+
+    // 3) «Продолжить» — любым селектором
+    const cont = page
+      .locator('button:has-text("Продолжить"), [role="button"]:has-text("Продолжить"), text=/^Продолжить$/')
+      .first();
+    if (await cont.isVisible().catch(()=>false)) {
+      await cont.click({ timeout: 5000 }).catch(()=>{});
+      log('✅ Продолжить');
+      await page.waitForTimeout(400);
+    }
+
+    // 4) Если всё ещё не календарь — мягкий фоллбек: прямой переход к /#courts
+    if (!(await anyDay.isVisible().catch(()=>false))) {
+      await page.goto(COURTS_URL, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(()=>{});
+      await page.waitForTimeout(400);
+    } else {
+      break;
+    }
+  }
+
+  // финальная маленькая пауза
+  await page.waitForTimeout(250);
 }
 
 // ---------- days ----------
@@ -218,8 +265,7 @@ async function scrapeAll(page) {
     if (times.length) {
       result[d.label] = times;
     } else {
-      // оставим артефакты для отладки конкретного дня
-      await dump(page, `day-${d.label}`);
+      await dump(page, `day-${d.label}`); // артефакты для отладки конкретного дня
     }
   }
 
@@ -244,7 +290,13 @@ async function main() {
   log('🌐 Открываем сайт:', TARGET_URL);
   await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-  const all = await scrapeAll(page);
+  let all = {};
+  try {
+    all = await scrapeAll(page);
+  } catch (e) {
+    await dump(page, 'fatal');
+    throw e;
+  }
 
   // форматируем сообщение
   let text = '🎾 ТЕКУЩИЕ СЛОТЫ ЛУЖНИКИ\n\n';
@@ -256,7 +308,7 @@ async function main() {
       text += `📅 ${k}\n  ${all[k].join(', ')}\n\n`;
     }
   }
-  text += 'https://tennis.luzhniki.ru/#courts';
+  text += COURTS_URL;
 
   await sendTelegram(text);
   log('✅ Сообщение отправлено.');
