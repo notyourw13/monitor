@@ -58,15 +58,34 @@ async function testProxyReachable(u) {
 // ---------- telegram ----------
 async function sendTelegram(text) {
   if (!TG_BOT_TOKEN || !TG_CHAT_ID) {
-    log('TG creds missing; printing:\n' + text);
+    log('TG creds missing; printing message:\n' + text);
     return;
   }
-  const r = await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ chat_id: TG_CHAT_ID, text, disable_web_page_preview: true })
-  });
-  if (!r.ok) throw new Error('Telegram ' + r.status + ' ' + (await r.text().catch(()=>'')));
+
+  const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
+  const ids = TG_CHAT_ID.split(',').map(s => s.trim()).filter(Boolean);
+
+  for (const id of ids) {
+    try {
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: id,
+          text,
+          disable_web_page_preview: true,
+        }),
+      });
+      if (!r.ok) {
+        const body = await r.text().catch(() => '');
+        log('⚠️ Ошибка Telegram для', id, r.status, body);
+      } else {
+        log('✅ Сообщение успешно отправлено пользователю', id);
+      }
+    } catch (e) {
+      log('⚠️ Исключение при отправке пользователю', id, e.message);
+    }
+  }
 }
 
 // ---------- artifacts ----------
@@ -87,7 +106,6 @@ async function launchBrowserWithProxy(raw) {
 
 // ---------- wizard (robust) ----------
 async function clickThroughWizard(page) {
-  // Баннер (если виден)
   const banner = page.locator('text=Аренда теннисных кортов').first();
   if (await banner.isVisible().catch(()=>false)) {
     await banner.click({ timeout: 20000 }).catch(()=>{});
@@ -97,14 +115,12 @@ async function clickThroughWizard(page) {
 
   const deadline = Date.now() + 15000;
   while (Date.now() < deadline) {
-    // Уже календарь?
     const anyDay = page.locator('button div:nth-child(2)').filter({ hasText: /^\d{1,2}$/ }).first();
     if (await anyDay.isVisible().catch(()=>false)) {
       log('➡️ Уже на экране календаря');
       break;
     }
 
-    // Карточка «Крытые»
     const indoorByText = page.locator('text=/Аренда\\s+крытых\\s+кортов/i').first();
     const indoorCard =
       (await indoorByText.isVisible().catch(()=>false)) ? indoorByText :
@@ -121,7 +137,6 @@ async function clickThroughWizard(page) {
       await page.waitForTimeout(200);
     }
 
-    // «Продолжить»
     const cont = page
       .locator('button:has-text("Продолжить"), [role="button"]:has-text("Продолжить"), text=/^Продолжить$/')
       .first();
@@ -131,7 +146,6 @@ async function clickThroughWizard(page) {
       await page.waitForTimeout(400);
     }
 
-    // Фоллбек в /#courts
     if (!(await anyDay.isVisible().catch(()=>false))) {
       await page.goto(COURTS_URL, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(()=>{});
       await page.waitForTimeout(400);
@@ -144,7 +158,6 @@ async function clickThroughWizard(page) {
 
 // ---------- days ----------
 async function findDayButtons(page) {
-  // собираем только видимые и НЕ отключённые кнопки
   const allBtns = page.locator('button');
   const cnt = await allBtns.count().catch(()=>0);
   const list = [];
@@ -178,10 +191,7 @@ async function getSelectedDayLabel(page) {
 // ---------- slots helpers ----------
 const TIMES_RE = /\b(\d{1,2}):(\d{2})\b/;
 const padTime = (h, m) => `${String(h).padStart(2,'0')}:${m}`;
-
-// усиленное ожидание рендера сетки со слотами
 async function ensureSlotsRendered(page) {
-  // в начало, лёгкие переключения, чтобы SPA перерисовала
   await page.evaluate(()=>window.scrollTo({ top: 0 }));
   await page.waitForTimeout(120);
   const toggles = [page.locator('text=/^Утро$/i').first(), page.locator('text=/^Вечер$/i').first()];
@@ -192,20 +202,16 @@ async function ensureSlotsRendered(page) {
       await page.waitForTimeout(120);
     }
   }
-
-  // ждём секции с time-slot (ul/div), несколько попыток
   const containerSel = 'ul[class*="time-slot"], div[class*="time-slot"]';
   for (let i = 0; i < 4; i++) {
     if (await page.locator(containerSel).first().isVisible().catch(()=>false)) break;
     await page.waitForTimeout(800);
   }
-
-  // финальная страховка — чуть прокручиваем и ждём
   await page.evaluate(()=>window.scrollBy(0, window.innerHeight/3)).catch(()=>{});
   await page.waitForTimeout(500);
 }
 
-// объединённый сбор методами 1+4+5+7
+// ---------- collect slots ----------
 async function collectTimesCombined(page) {
   const out = new Set();
 
@@ -215,7 +221,7 @@ async function collectTimesCombined(page) {
     for (const el of els) {
       const t = (await el.innerText().catch(()=> '')).trim();
       const m = t.match(TIMES_RE);
-      if (m) out.add(padTime(m[1], m[2]));
+      if (m) out.add(`${m[1].padStart(2,'0')}:${m[2]}`);
     }
   }
 
@@ -226,7 +232,7 @@ async function collectTimesCombined(page) {
       for (const el of els) {
         const t = (await el.innerText().catch(()=> '')).trim();
         const m = t.match(TIMES_RE);
-        if (m) out.add(padTime(m[1], m[2]));
+        if (m) out.add(`${m[1].padStart(2,'0')}:${m[2]}`);
       }
     }
   }
@@ -237,7 +243,7 @@ async function collectTimesCombined(page) {
     for (const el of els) {
       const t = (await el.innerText().catch(()=> '')).trim();
       const m = t.match(TIMES_RE);
-      if (m) out.add(padTime(m[1], m[2]));
+      if (m) out.add(`${m[1].padStart(2,'0')}:${m[2]}`);
     }
   }
 
@@ -247,11 +253,10 @@ async function collectTimesCombined(page) {
     for (const el of els) {
       const t = (await el.innerText().catch(()=> '')).trim();
       const m = t.match(TIMES_RE);
-      if (m) out.add(padTime(m[1], m[2]));
+      if (m) out.add(`${m[1].padStart(2,'0')}:${m[2]}`);
     }
   }
 
-  // если всё ещё пусто — небольшой нудж и повтор SLOT_SEL
   if (out.size === 0) {
     await page.evaluate(()=>window.scrollBy(0, Math.round(window.innerHeight*0.4))).catch(()=>{});
     await page.waitForTimeout(150);
@@ -259,7 +264,7 @@ async function collectTimesCombined(page) {
     for (const el of els) {
       const t = (await el.innerText().catch(()=> '')).trim();
       const m = t.match(TIMES_RE);
-      if (m) out.add(padTime(m[1], m[2]));
+      if (m) out.add(`${m[1].padStart(2,'0')}:${m[2]}`);
     }
   }
 
@@ -269,17 +274,12 @@ async function collectTimesCombined(page) {
 // ---------- scrape ----------
 async function scrapeAll(page) {
   await clickThroughWizard(page);
-
   const days = await findDayButtons(page);
   log('📅 Дни (кликабельные):', days.map(d=>d.label).join(', '));
-
   const result = {};
   for (const d of days) {
-    // центрируем и кликаем
     await d.btn.evaluate(el => el.scrollIntoView({ block: 'center' })).catch(()=>{});
     await d.btn.click({ timeout: 1200 }).catch(()=>{});
-
-    // ждём выделение (повторные попытки)
     for (let i=0; i<8; i++) {
       const selected = await getSelectedDayLabel(page);
       if (selected === d.label) break;
@@ -287,33 +287,26 @@ async function scrapeAll(page) {
       if (i === 5) await d.btn.evaluate(el => el.click()).catch(()=>{});
       await page.waitForTimeout(120);
     }
-
-    // если не выделился — пропускаем
     const selectedFinal = await getSelectedDayLabel(page);
     if (selectedFinal !== d.label) {
       log(`↷ Пропускаем день ${d.label} — не выделился`);
       continue;
     }
-
-    // гарантируем отрисовку сетки и слотов
     await ensureSlotsRendered(page);
-    await page.waitForTimeout(600); // ДОП. пауза перед реальным сбором
-
+    await page.waitForTimeout(600);
     const times = await collectTimesCombined(page);
     if (times.length) {
       result[d.label] = times;
     } else {
-      await dump(page, `day-${d.label}`); // снимки для точечной отладки
+      await dump(page, `day-${d.label}`);
     }
   }
-
   return result;
 }
 
 // ---------- main ----------
 async function main() {
   const start = Date.now();
-
   let chosen = null;
   if (PROXY_LIST) {
     for (const p of PROXY_LIST.split(/\r?\n/).map(parseProxyLine).filter(Boolean)) {
@@ -329,33 +322,22 @@ async function main() {
   await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
   let all = {};
-  try {
-    all = await scrapeAll(page);
-  } catch (e) {
-    await dump(page, 'fatal');
-    throw e;
-  }
+  try { all = await scrapeAll(page); } 
+  catch (e) { await dump(page, 'fatal'); throw e; }
 
-  // форматируем сообщение
   let text = '🎾 ТЕКУЩИЕ СЛОТЫ ЛУЖНИКИ\n\n';
   const keys = Object.keys(all).sort((a,b)=>(+a)-(+b));
   if (!keys.length) {
     text += '(ничего не найдено)\n\n';
   } else {
-    for (const k of keys) {
-      text += `📅 ${k}\n  ${all[k].join(', ')}\n\n`;
-    }
+    for (const k of keys) text += `📅 ${k}\n  ${all[k].join(', ')}\n\n`;
   }
   text += COURTS_URL;
 
   await sendTelegram(text);
   log('✅ Сообщение отправлено.');
-
-  await ctx.close();
-  await browser.close();
-  if (server?.startsWith('http://127.0.0.1:')) {
-    try { await proxyChain.closeAnonymizedProxy(server, true); } catch {}
-  }
+  await ctx.close(); await browser.close();
+  if (server?.startsWith('http://127.0.0.1:')) try { await proxyChain.closeAnonymizedProxy(server, true); } catch {}
   log('⏱ Время выполнения:', ((Date.now() - start) / 1000).toFixed(1) + 's');
 }
 
