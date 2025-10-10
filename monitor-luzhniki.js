@@ -1,4 +1,4 @@
-// --- Luzhniki monitor (через баннер + резервный переход на /courts) ---
+// --- Luzhniki monitor: надёжные клики (баннер → крытые → Продолжить) + proxy-chain ---
 import fs from 'fs';
 import { chromium } from 'playwright';
 import proxyChain from 'proxy-chain';
@@ -10,7 +10,8 @@ const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || '';
 const TG_CHAT_ID   = process.env.TG_CHAT_ID   || '';
 const PROXY_URL    = (process.env.PROXY_URL || '').trim();
 const PROXY_LIST   = (process.env.PROXY_LIST || '').split(/[\n, ]+/).map(s=>s.trim()).filter(Boolean);
-const URL          = 'https://tennis.luzhniki.ru/';
+const HOME_URL     = 'https://tennis.luzhniki.ru/';
+const COURTS_URL   = 'https://tennis.luzhniki.ru/#courts';
 
 const LOGFILE = `run-${Date.now()}.log`;
 function log(...a){ const line = `${new Date().toISOString()} ${a.join(' ')}`; console.log(line); try{ fs.appendFileSync(LOGFILE, line+'\n'); }catch{} }
@@ -56,83 +57,97 @@ async function prepareBridge(){
   return { server:'', close: async()=>{} };
 }
 
-// ===== UTILS =====
-async function dumpArtifacts(page, tag='snap'){
-  try{ await page.waitForTimeout(200); }catch{}
+// ===== ARTIFACTS =====
+async function snap(page, tag){
   try{ await page.screenshot({ path:`art-${tag}.png`, fullPage:true }); }catch{}
   try{ const html = await page.content(); await fs.promises.writeFile(`art-${tag}.html`, html); }catch{}
 }
+async function dumpOnError(page, tag){ try{ await page.waitForTimeout(200); await snap(page, tag); }catch{} }
 
 function moscowTodayISO(){
   const now = new Date(new Date().toLocaleString('en-US', { timeZone:'Europe/Moscow' }));
   return now.toISOString().slice(0,10);
 }
 
-// ---------- переход на нужную страницу ----------
-async function ensureOnCourts(page) {
-  // если мы всё ещё на главной — сначала кликаем баннер, затем жёсткий фолбэк на /#courts
-  if (!/\/courts/i.test(page.url())) {
-    const clicked = await (async () => {
-      const btn = page.locator('xpath=//*[contains(normalize-space(.),"Аренда теннисных кортов")]').first();
-      if (await btn.isVisible().catch(() => false)) {
-        log('Нашли баннер «Аренда теннисных кортов», кликаем');
-        await btn.click({ timeout: 4000 }).catch(() => {});
-        await page.waitForTimeout(500);
-        if (/\/courts/i.test(page.url())) return true;
-      }
-      return false;
-    })();
-
-    if (!clicked) {
-      log('Переходим напрямую на /#courts');
-      await page.goto('https://tennis.luzhniki.ru/#courts', { waitUntil: 'domcontentloaded', timeout: 60000 });
-    }
+// ===== NAV HELPERS =====
+async function acceptCookies(page){
+  const sels = [
+    'xpath=//button[contains(translate(normalize-space(.),"ПРИНЯТЬ","принять"),"принять")]',
+    'xpath=//button[contains(translate(normalize-space(.),"СОГЛАСЕН","согласен"),"согласен")]',
+    'xpath=//button[contains(translate(normalize-space(.),"OK","ok"),"ok")]'
+  ];
+  for(const s of sels){
+    const b = page.locator(s).first();
+    if(await b.isVisible().catch(()=>false)){ await b.click().catch(()=>{}); await page.waitForTimeout(200); break; }
   }
-
-  // иногда контент грузится с задержкой — ждём появление слов «крыт/открыт» или кнопки «Продолжить»
-  await page.waitForSelector(
-    'xpath=//*[contains(translate(normalize-space(.),"КРЫТ","крт"),"к") or contains(translate(normalize-space(.),"ОТКРЫТ","ткр"),"т") or self::button[contains(normalize-space(.),"Продолжить")]]',
-    { timeout: 15000 }
-  ).catch(() => {});
 }
 
-// ---------- выбор карточки «Аренда крытых кортов» ----------
-async function clickCovered(page) {
-  // Пытаемся всеми способами зацепить карточку «крытые корты»
+async function ensureOnCourts(page) {
+  // если мы на главной — кликаем баннер «Аренда теннисных кортов», иначе идём напрямую
+  if (!/\/courts/i.test(page.url())) {
+    const btn = page.locator('xpath=//*[contains(normalize-space(.),"Аренда теннисных кортов")]').first();
+    if (await btn.isVisible().catch(() => false)) {
+      log('Нашли баннер «Аренда теннисных кортов», кликаем');
+      await btn.click({ timeout: 4000 }).catch(() => {});
+      await page.waitForTimeout(500);
+    }
+    if (!/\/courts/i.test(page.url())) {
+      log('Переходим напрямую на /#courts');
+      await page.goto(COURTS_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    }
+  }
+  await acceptCookies(page);
+  await snap(page,'after-courts-open');
+}
+
+// ——— поиск карточки «Аренда крытых кортов» (в модалке/оверлее) ———
+async function openCovered(page){
+  // 1) ждём появление окна-выбора
+  await page.waitForTimeout(400);
+  // кандидаты на «крытые»
   const candidates = [
-    page.locator('xpath=//button[contains(translate(normalize-space(.),"КРЫТ","крт"),"к")]'),
-    page.locator('xpath=//*[self::button or @role="button" or self::a or self::div][contains(translate(normalize-space(.),"КРЫТ","крт"),"к")]'),
-    page.locator('xpath=//*[contains(translate(normalize-space(.),"КРЫТ","крт"),"к")]/ancestor::*[self::div or self::section][1]//button')
+    // явные кнопки
+    'xpath=//button[contains(translate(normalize-space(.),"КРЫТ","крт"),"к")]',
+    // кликабельные блоки/плитки
+    'xpath=//*[self::button or @role="button" or self::a or self::div][contains(translate(normalize-space(.),"КРЫТ","крт"),"к")]',
+    // текстовая карточка
+    'xpath=//*[contains(normalize-space(.),"Аренда") and contains(translate(normalize-space(.),"КРЫТ","крт"),"к")]'
   ];
-
-  for (const loc of candidates) {
-    try {
-      if (await loc.isVisible({ timeout: 100 }).catch(() => false)) {
-        await loc.scrollIntoViewIfNeeded().catch(() => {});
-        await loc.click({ timeout: 3000 }).catch(() => {});
-        await page.waitForTimeout(300);
-        return true;
-      }
-    } catch {}
+  for(const s of candidates){
+    const loc = page.locator(s).first();
+    if(await loc.isVisible().catch(()=>false)){
+      await loc.scrollIntoViewIfNeeded().catch(()=>{});
+      await loc.click({ timeout: 4000 }).catch(()=>{});
+      await page.waitForTimeout(250);
+      await snap(page,'after-covered-click');
+      return true;
+    }
   }
-
-  const anyTile = page.locator(
-    'xpath=//*[contains(translate(normalize-space(.),"АРЕНДА","аренда"),"аренда") and contains(translate(normalize-space(.),"КОРТОВ","кортов"),"кортов")]'
-  ).first();
-  if (await anyTile.isVisible().catch(() => false)) {
-    await anyTile.click({ timeout: 3000 }).catch(() => {});
-    await page.waitForTimeout(300);
-    return true;
-  }
-
   return false;
 }
 
 async function clickContinue(page){
-  const btn = page.locator('xpath=//button[contains(normalize-space(.),"Продолжить")]').first();
-  if(await btn.isVisible().catch(()=>false)){ await btn.click({timeout:4000}).catch(()=>{}); return true; }
+  // иногда это <button>, иногда это ссылка-стилизованная кнопка
+  const btn = page.locator(
+    'xpath=//*[self::button or self::a][contains(normalize-space(.),"Продолжить")]'
+  ).first();
+
+  // подождём до 10с — контент грузится лениво
+  for(let i=0;i<20;i++){
+    if(await btn.isVisible().catch(()=>false)) break;
+    await page.waitForTimeout(500);
+  }
+
+  if(await btn.isVisible().catch(()=>false)){
+    await btn.scrollIntoViewIfNeeded().catch(()=>{});
+    await btn.click({ timeout: 4000 }).catch(()=>{});
+    await page.waitForTimeout(400);
+    await snap(page,'after-continue-click');
+    return true;
+  }
   return false;
 }
+
 async function findCalendarRoot(page){
   const sels = [
     'xpath=//*[contains(@class,"calendar")]',
@@ -178,17 +193,23 @@ async function collectTimesFromPage(page){
 // ===== SCRAPE =====
 async function scrapeWizard(page){
   await page.waitForLoadState('domcontentloaded', { timeout: 60_000 });
-  await ensureOnCourts(page); // <— добавили
+  await ensureOnCourts(page);
 
-  const ok1 = await clickCovered(page);
-  if(!ok1) throw new Error('Не нашли карточку «Аренда крытых кортов»');
+  // 1) кликаем «крытые»
+  const hasCovered = await openCovered(page);
+  if(!hasCovered){
+    await dumpOnError(page,'no-covered');
+    throw new Error('Не нашли карточку «Аренда крытых кортов»');
+  }
 
-  await page.waitForTimeout(300);
+  // 2) жмём «Продолжить» (если есть)
   const ok2 = await clickContinue(page);
   if(!ok2) log('Кнопка «Продолжить» не найдена (возможно, шаг объединён)');
 
+  // 3) ждём, пока появится расписание/слоты
   await page.waitForTimeout(800);
-  await page.waitForSelector('xpath=//*[contains(normalize-space(.),"Утро") or contains(normalize-space(.),"Вечер")]', { timeout: 30_000 }).catch(()=>{});
+  await page.waitForSelector('xpath=//*[contains(normalize-space(.),"Утро") or contains(normalize-space(.),"Вечер")]', { timeout: 20_000 }).catch(()=>{});
+  await snap(page,'after-wizard');
 
   const root = await findCalendarRoot(page);
   let days = await getDayButtons(root);
@@ -201,7 +222,7 @@ async function scrapeWizard(page){
   if(!days.length){
     const times = await collectTimesFromPage(page);
     log(`Текущий день: слотов ${times.length}`);
-    if(!times.length) await dumpArtifacts(page, 'no-days');
+    if(!times.length) await dumpOnError(page, 'no-days');
     results.push({ date: iso, times });
     return results;
   }
@@ -214,7 +235,7 @@ async function scrapeWizard(page){
     await page.waitForTimeout(400);
     const times = await collectTimesFromPage(page);
     log(`День ${label || i+1}: слотов ${times.length}`);
-    if(!times.length) await dumpArtifacts(page, `day-${String(label || i+1).padStart(2,'0')}`);
+    if(!times.length) await dumpOnError(page, `day-${String(label || i+1).padStart(2,'0')}`);
     results.push({ date: iso, times });
   }
 
@@ -228,13 +249,13 @@ async function scrapeWizard(page){
 
 function formatMessage(rows){
   if(!rows?.length || rows.every(r => !r.times?.length))
-    return `ТЕКУЩИЕ СЛОТЫ ЛУЖНИКИ\n\n(ничего не найдено)\n\nhttps://tennis.luzhniki.ru/#courts`;
+    return `ТЕКУЩИЕ СЛОТЫ ЛУЖНИКИ\n\n(ничего не найдено)\n\n${COURTS_URL}`;
   let out = 'ТЕКУЩИЕ СЛОТЫ ЛУЖНИКИ\n';
   for(const r of rows){
     out += `\n${r.date}:\n`;
     for(const t of r.times) out += `  ${t}\n`;
   }
-  out += `\nhttps://tennis.luzhniki.ru/#courts`;
+  out += `\n${COURTS_URL}`;
   return out;
 }
 
@@ -252,13 +273,13 @@ function formatMessage(rows){
     context = await browser.newContext({ locale:'ru-RU', timezoneId:'Europe/Moscow' });
     const page = await context.newPage();
 
-    await page.goto(URL, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    await page.goto(HOME_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 });
     const rows = await scrapeWizard(page);
     const msg = formatMessage(rows);
     await sendTelegram(msg);
   }catch(e){
     log('Ошибка:', e.message || e);
-    try{ const p = context?.pages?.()[0]; if(p) await dumpArtifacts(p, 'error'); }catch{}
+    try{ const p = context?.pages?.()[0]; if(p) await dumpOnError(p, 'error'); }catch{}
     process.exitCode = 1;
   }finally{
     try{ await context?.close(); }catch{}
