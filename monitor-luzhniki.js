@@ -1,4 +1,4 @@
-// --- Luzhniki Monitor vFinal (slots via UL 2 & 4 + class triple underscore) ---
+// --- Luzhniki Monitor vFinal (fast & robust) ---
 import playwright from 'playwright';
 import fetch from 'node-fetch';
 import proxyChain from 'proxy-chain';
@@ -84,20 +84,17 @@ async function launchBrowserWithProxy(rawProxy) {
   return { browser, browserProxy };
 }
 
-// ---------- scraping helpers ----------
+// ---------- helpers ----------
 async function clickThroughWizard(page) {
-  // баннер на главной
   const banner = page.locator('text=Аренда теннисных кортов').first();
   await banner.waitFor({ timeout: 20000 });
   await banner.click({ timeout: 4000 });
   log('✅ Клик по баннеру «Аренда теннисных кортов»');
 
-  // карточка "Крытые"
   await page.waitForSelector('text=Аренда крытых кортов', { timeout: 20000 });
   await page.locator('text=Аренда крытых кортов').first().click({ timeout: 4000 });
   log('✅ Клик по карточке «Аренда крытых кортов»');
 
-  // «Продолжить»
   const contBtn = page.locator('button:has-text("Продолжить")').first();
   if (await contBtn.isVisible().catch(() => false)) {
     await contBtn.click({ timeout: 5000 });
@@ -109,11 +106,25 @@ async function clickThroughWizard(page) {
   await page.waitForTimeout(800);
 }
 
-// Собираем времена строго из ul:nth-child(2) и ul:nth-child(4),
-// и плюс safety-слой: любые элементы с текстом HH:MM.
+async function waitTimesAppear(page, timeoutMs = 3500) {
+  return page.waitForFunction((ms) => {
+    const re = /^\s*\d{1,2}:\d{2}\s*$/;
+    const hasIn = (root) => {
+      if (!root) return false;
+      const nodes = root.querySelectorAll('[class^="time-slot-module__slot___"], [class*="time-slot-module__slot___"]');
+      for (const n of nodes) if (re.test((n.textContent || '').trim())) return true;
+      return false;
+    };
+    const root2 = document.querySelector('ul:nth-child(2)');
+    const root4 = document.querySelector('ul:nth-child(4)');
+    return hasIn(root2) || hasIn(root4) || re.test(document.body.innerText || '');
+  }, timeoutMs, timeoutMs).catch(() => {});
+}
+
 async function collectTimesForCurrentDay(page) {
-  // ждём дорисовку
-  await page.waitForTimeout(250);
+  await page.waitForTimeout(150);
+  await page.evaluate(() => window.scrollBy(0, Math.round(window.innerHeight * 0.4)));
+  await waitTimesAppear(page, 3500);
 
   const times = await page.evaluate(() => {
     const acc = new Set();
@@ -129,44 +140,37 @@ async function collectTimesForCurrentDay(page) {
         });
     };
 
-    // именно эти два списка, как ты показал в Distill:
     pull(document.querySelector('ul:nth-child(2)'));
     pull(document.querySelector('ul:nth-child(4)'));
 
-    // fallback: любая видимая HH:MM (если вдруг разметка поменялась)
     if (acc.size === 0) {
       document.querySelectorAll('button, span, div, li').forEach(el => {
-        const t = (el.textContent || '').trim();
-        const m = t.match(re);
+        const m = (el.textContent || '').trim().match(re);
         if (m) acc.add(m[1].padStart(2, '0') + ':' + m[2]);
       });
     }
-
     return Array.from(acc).sort();
   });
 
   return times;
 }
 
-// ---------- main scraper ----------
+// ---------- scraper ----------
 async function scrapeAll(page) {
   await clickThroughWizard(page);
 
-  // небольшой скролл, чтобы оба списка (утро/вечер) попали в вьюпорт
-  await page.evaluate(() => window.scrollBy(0, Math.round(window.innerHeight * 0.33)));
-  await page.waitForTimeout(200);
-
-  // берём максимум кандидатов на «дни»
   const dayCandidates = await page.locator('button:nth-child(n), [role="button"]').all();
   log('📅 Найдено кнопок-дней:', dayCandidates.length);
 
   const result = {};
+  const clicked = [];
 
-  for (let i = 0; i < dayCandidates.length; i++) {
+  // ограничимся первыми 10 днями, чтобы быстро прийти к результату
+  const limit = Math.min(10, dayCandidates.length);
+
+  for (let i = 0; i < limit; i++) {
     const el = dayCandidates[i];
 
-    // из некоторых селекторов дни — это button, но внутри ещё div с цифрой
-    // поэтому читаем текст и у button, и у ближайших детей
     let label = (await el.innerText().catch(() => '')).trim();
     if (!/^\d{1,2}$/.test(label)) {
       try {
@@ -176,25 +180,11 @@ async function scrapeAll(page) {
     }
     if (!/^\d{1,2}$/.test(label)) continue;
 
-    // кликаем день
+    clicked.push(label);
+
     await el.scrollIntoViewIfNeeded().catch(() => {});
-    await el.click({ timeout: 3000 }).catch(() => {});
-    await page.waitForTimeout(600);
-
-    // на всякий случай — докрутим страницу
-    await page.evaluate(() => window.scrollBy(0, Math.round(window.innerHeight * 0.4)));
-    await page.waitForTimeout(200);
-
-    // ждём, что появится хотя бы один HH:MM (до 3с)
-    await page.waitForFunction(() => {
-      const re = /^\s*\d{1,2}:\d{2}\s*$/;
-      const root2 = document.querySelector('ul:nth-child(2)');
-      const root4 = document.querySelector('ul:nth-child(4)');
-      const has = (root) =>
-        !!root && !!Array.from(root.querySelectorAll('[class^="time-slot-module__slot___"], [class*="time-slot-module__slot___"]'))
-          .find(el => re.test((el.textContent || '').trim()));
-      return has(root2) || has(root4) || re.test(document.body.innerText || '');
-    }, { timeout: 3000 }).catch(() => {});
+    await el.click({ timeout: 2000 }).catch(() => {});
+    await page.waitForTimeout(500);
 
     const times = await collectTimesForCurrentDay(page);
     if (times.length) {
@@ -203,14 +193,13 @@ async function scrapeAll(page) {
     }
   }
 
-  return result;
+  return { result, clicked };
 }
 
-// ---------- program entry ----------
+// ---------- entry ----------
 async function main() {
   const start = Date.now();
 
-  // pick any working proxy from PROXY_LIST
   let chosenProxy = null;
   if (PROXY_LIST) {
     const lines = PROXY_LIST.split(/\r?\n/).map(parseProxyLine).filter(Boolean);
@@ -221,20 +210,22 @@ async function main() {
   }
 
   const { browser, browserProxy } = await launchBrowserWithProxy(chosenProxy);
-  const ctx = await browser.newContext();
+  const ctx = await browser.newContext({ viewport: { width: 1280, height: 1600 } });
   const page = await ctx.newPage();
 
   log('🌐 Открываем сайт:', TARGET_URL);
   await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-  const all = await scrapeAll(page);
+  const { result, clicked } = await scrapeAll(page);
 
   let text = '🎾 ТЕКУЩИЕ СЛОТЫ ЛУЖНИКИ\n\n';
-  const dayKeys = Object.keys(all);
+  const dayKeys = Object.keys(result).sort((a,b)=>parseInt(a)-parseInt(b));
   if (!dayKeys.length) {
-    text += '(ничего не найдено)\n\n';
+    text += '(ничего не найдено)\n';
+    if (clicked.length) text += `Проверены дни: ${clicked.join(', ')}\n`;
+    text += '\n';
   } else {
-    for (const d of dayKeys) text += `📅 ${d}\n${all[d].join(', ')}\n\n`;
+    for (const d of dayKeys) text += `📅 ${d}\n${result[d].join(', ')}\n\n`;
   }
   text += 'https://tennis.luzhniki.ru/#courts';
 
