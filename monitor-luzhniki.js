@@ -1,4 +1,4 @@
-// --- Luzhniki monitor (правильный вход через баннер) ---
+// --- Luzhniki monitor (через баннер + резервный переход на /courts) ---
 import fs from 'fs';
 import { chromium } from 'playwright';
 import proxyChain from 'proxy-chain';
@@ -68,29 +68,66 @@ function moscowTodayISO(){
   return now.toISOString().slice(0,10);
 }
 
-async function clickBannerToCourts(page) {
-  const btn = page.locator('text="Аренда теннисных кортов"');
-  if (await btn.isVisible().catch(()=>false)) {
-    log('Нашли баннер «Аренда теннисных кортов», кликаем');
-    await btn.first().click({ timeout: 5000 }).catch(()=>{});
-    await page.waitForURL(/courts/, { timeout: 15000 }).catch(()=>{});
+// ---------- переход на нужную страницу ----------
+async function ensureOnCourts(page) {
+  // если мы всё ещё на главной — сначала кликаем баннер, затем жёсткий фолбэк на /#courts
+  if (!/\/courts/i.test(page.url())) {
+    const clicked = await (async () => {
+      const btn = page.locator('xpath=//*[contains(normalize-space(.),"Аренда теннисных кортов")]').first();
+      if (await btn.isVisible().catch(() => false)) {
+        log('Нашли баннер «Аренда теннисных кортов», кликаем');
+        await btn.click({ timeout: 4000 }).catch(() => {});
+        await page.waitForTimeout(500);
+        if (/\/courts/i.test(page.url())) return true;
+      }
+      return false;
+    })();
+
+    if (!clicked) {
+      log('Переходим напрямую на /#courts');
+      await page.goto('https://tennis.luzhniki.ru/#courts', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    }
+  }
+
+  // иногда контент грузится с задержкой — ждём появление слов «крыт/открыт» или кнопки «Продолжить»
+  await page.waitForSelector(
+    'xpath=//*[contains(translate(normalize-space(.),"КРЫТ","крт"),"к") or contains(translate(normalize-space(.),"ОТКРЫТ","ткр"),"т") or self::button[contains(normalize-space(.),"Продолжить")]]',
+    { timeout: 15000 }
+  ).catch(() => {});
+}
+
+// ---------- выбор карточки «Аренда крытых кортов» ----------
+async function clickCovered(page) {
+  // Пытаемся всеми способами зацепить карточку «крытые корты»
+  const candidates = [
+    page.locator('xpath=//button[contains(translate(normalize-space(.),"КРЫТ","крт"),"к")]'),
+    page.locator('xpath=//*[self::button or @role="button" or self::a or self::div][contains(translate(normalize-space(.),"КРЫТ","крт"),"к")]'),
+    page.locator('xpath=//*[contains(translate(normalize-space(.),"КРЫТ","крт"),"к")]/ancestor::*[self::div or self::section][1]//button')
+  ];
+
+  for (const loc of candidates) {
+    try {
+      if (await loc.isVisible({ timeout: 100 }).catch(() => false)) {
+        await loc.scrollIntoViewIfNeeded().catch(() => {});
+        await loc.click({ timeout: 3000 }).catch(() => {});
+        await page.waitForTimeout(300);
+        return true;
+      }
+    } catch {}
+  }
+
+  const anyTile = page.locator(
+    'xpath=//*[contains(translate(normalize-space(.),"АРЕНДА","аренда"),"аренда") and contains(translate(normalize-space(.),"КОРТОВ","кортов"),"кортов")]'
+  ).first();
+  if (await anyTile.isVisible().catch(() => false)) {
+    await anyTile.click({ timeout: 3000 }).catch(() => {});
+    await page.waitForTimeout(300);
     return true;
   }
+
   return false;
 }
 
-async function clickCovered(page){
-  const sels = [
-    'xpath=//*[contains(normalize-space(.),"Аренда крытых кортов")]//button',
-    'xpath=//*[contains(normalize-space(.),"Аренда крытых кортов")]',
-    'xpath=//button[contains(normalize-space(.),"+")]'
-  ];
-  for(const s of sels){
-    const loc = page.locator(s).first();
-    if(await loc.isVisible().catch(()=>false)){ await loc.click({timeout:4000}).catch(()=>{}); return true; }
-  }
-  return false;
-}
 async function clickContinue(page){
   const btn = page.locator('xpath=//button[contains(normalize-space(.),"Продолжить")]').first();
   if(await btn.isVisible().catch(()=>false)){ await btn.click({timeout:4000}).catch(()=>{}); return true; }
@@ -141,9 +178,7 @@ async function collectTimesFromPage(page){
 // ===== SCRAPE =====
 async function scrapeWizard(page){
   await page.waitForLoadState('domcontentloaded', { timeout: 60_000 });
-
-  // если мы на главной — перейти к кортам
-  await clickBannerToCourts(page);
+  await ensureOnCourts(page); // <— добавили
 
   const ok1 = await clickCovered(page);
   if(!ok1) throw new Error('Не нашли карточку «Аренда крытых кортов»');
