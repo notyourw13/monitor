@@ -1,4 +1,4 @@
-// --- Luzhniki Monitor (stable slot capture) ---
+// --- Luzhniki Monitor — 10 способов извлечь слоты для калибровки ---
 import playwright from 'playwright';
 import fetch from 'node-fetch';
 import proxyChain from 'proxy-chain';
@@ -94,7 +94,7 @@ async function clickThroughWizard(page) {
   if (await cont.isVisible().catch(() => false)) await cont.click({ timeout: 5000 });
   else await page.locator('text=Продолжить').first().click({ timeout: 5000 }).catch(() => {});
   log('✅ Продолжить');
-  await page.waitForTimeout(400);
+  await page.waitForTimeout(500);
 }
 
 // ---------- days ----------
@@ -121,66 +121,248 @@ async function getSelectedDayLabel(page) {
   return /^\d{1,2}$/.test(t) ? t : '';
 }
 
-// ---------- collect times (simplified & robust) ----------
-async function collectTimes(page, dayLabel) {
-  // ждём, когда список слотов вообще появится/перерисуется
-  await page.waitForSelector(SLOT_SEL, { state:'visible', timeout: 5000 }).catch(()=>{});
-  await page.waitForTimeout(150);
+// ---------- helpers ----------
+const norm = (arr) => Array.from(new Set(arr)).sort((a,b)=>a.localeCompare(b));
+const TIMES_RE = /\b(\d{1,2}):(\d{2})\b/;
 
-  // немного прокрутим, чтобы и «Вечер» догрузился
-  await page.evaluate(()=>{
-    window.scrollBy(0, Math.round(window.innerHeight*0.4));
-  }).catch(()=>{});
-  await page.waitForTimeout(100);
-
-  const times = await page.evaluate((SLOT_SEL_ARG) => {
-    const acc = new Set();
-    const re = /\b(\d{1,2}):(\d{2})\b/;
-    document.querySelectorAll(SLOT_SEL_ARG).forEach(el => {
-      // Playwright помечает видимые элементы корректно — используем offsetParent
-      if (!el.offsetParent) return;
-      const t = (el.textContent || '').trim();
-      const m = t.match(re);
-      if (m) {
-        const hh = m[1].padStart(2,'0');
-        acc.add(`${hh}:${m[2]}`);
-      }
-    });
-    return Array.from(acc).sort((a,b)=>a.localeCompare(b));
-  }, SLOT_SEL);
-
-  if (times.length === 0) await dump(page, `day-${dayLabel}`);
-  return times;
+function padTime(hh, mm) {
+  return `${String(hh).padStart(2,'0')}:${mm}`;
 }
 
-// ---------- scrape ----------
-async function scrapeAll(page) {
-  await clickThroughWizard(page);
-  const days = await findDayButtons(page);
-  log('📅 Кандидаты:', days.map(d=>d.label).join(', '));
+// ---------- 10 стратегий ----------
+async function strategy1_SLOT_SEL(page) {
+  // Прямой селектор классов слотов
+  const els = await page.locator(SLOT_SEL).all().catch(()=>[]);
+  const out = [];
+  for (const el of els) {
+    const t = (await el.innerText().catch(()=> '')).trim();
+    const m = t.match(TIMES_RE);
+    if (m) out.push(padTime(m[1], m[2]));
+  }
+  return norm(out);
+}
 
-  const result = {};
-  for (const d of days) {
-    await d.btn.scrollIntoViewIfNeeded().catch(()=>{});
-    await d.btn.click({ timeout:1500 }).catch(()=>{});
-    await page.waitForTimeout(220);
-
-    const selected = await getSelectedDayLabel(page);
-    if (selected !== d.label) continue;
-
-    // прожмём переключатели, если есть — это триггерит дорисовку
-    for (const name of ['Утро','Вечер']) {
-      const sw = page.locator(`text=${name}`).first();
-      if (await sw.isVisible().catch(()=>false)) {
-        await sw.click({ timeout: 350 }).catch(()=>{});
-        await page.waitForTimeout(60);
+async function strategy2_scopedSections(page) {
+  // Секционно: внутри контейнеров, где есть заголовок «Утро»/«Вечер»
+  return await page.evaluate((SLOT_SEL_ARG) => {
+    const uniq = new Set();
+    const re = /\b(\d{1,2}):(\d{2})\b/;
+    const sections = [];
+    [...document.querySelectorAll('body *')].forEach(el => {
+      const txt = (el.textContent||'').trim();
+      if (/^(Утро|Вечер)\s*$/i.test(txt)) {
+        const box = el.closest('*');
+        if (box && !sections.includes(box)) sections.push(box);
       }
+    });
+    for (const sec of sections) {
+      sec.querySelectorAll(SLOT_SEL_ARG).forEach(slot => {
+        const t = (slot.textContent||'').trim();
+        const m = t.match(re);
+        if (m) uniq.add(`${String(m[1]).padStart(2,'0')}:${m[2]}`);
+      });
+    }
+    return Array.from(uniq).sort((a,b)=>a.localeCompare(b));
+  }, SLOT_SEL);
+}
+
+async function strategy3_textRegexInModal(page) {
+  // По тексту «HH:MM» внутри модалки (ограничим ближайшим видимым диалогом)
+  const dialog = page.locator('[role="dialog"], [class*="modal"], body').first();
+  const handles = await dialog.locator('text=/\\b\\d{1,2}:\\d{2}\\b/').all().catch(()=>[]);
+  const out = [];
+  for (const el of handles) {
+    const t = (await el.innerText().catch(()=> '')).trim();
+    const m = t.match(TIMES_RE);
+    if (m) out.push(padTime(m[1], m[2]));
+  }
+  return norm(out);
+}
+
+async function strategy4_ul2_ul4_specific(page) {
+  // Что ты видел в Distill: ul:nth-child(2/4) + класс слота
+  const selList = [
+    'ul:nth-child(2) ' + SLOT_SEL,
+    'ul:nth-child(4) ' + SLOT_SEL,
+  ];
+  const out = [];
+  for (const sel of selList) {
+    const els = await page.locator(sel).all().catch(()=>[]);
+    for (const el of els) {
+      const t = (await el.innerText().catch(()=> '')).trim();
+      const m = t.match(TIMES_RE);
+      if (m) out.push(padTime(m[1], m[2]));
+    }
+  }
+  return norm(out);
+}
+
+async function strategy5_locatorFilter(page) {
+  // Playwright filter hasText
+  const els = await page.locator(SLOT_SEL).filter({ hasText: /:\d{2}/ }).all().catch(()=>[]);
+  const out = [];
+  for (const el of els) {
+    const t = (await el.innerText().catch(()=> '')).trim();
+    const m = t.match(TIMES_RE);
+    if (m) out.push(padTime(m[1], m[2]));
+  }
+  return norm(out);
+}
+
+async function strategy6_innerHTMLRegex(page) {
+  // Грубый парсинг из HTML модалки
+  const html = await page.content();
+  const out = [];
+  let m;
+  const re = /\b(\d{1,2}):(\d{2})\b/g;
+  while ((m = re.exec(html)) !== null) out.push(padTime(m[1], m[2]));
+  return norm(out);
+}
+
+async function strategy7_slotDesktopWidth(page) {
+  // Элементы с desktop-шириной слота
+  const els = await page.locator('[class*="slotDesktopWidth"]').all().catch(()=>[]);
+  const out = [];
+  for (const el of els) {
+    const t = (await el.innerText().catch(()=> '')).trim();
+    const m = t.match(TIMES_RE);
+    if (m) out.push(padTime(m[1], m[2]));
+  }
+  return norm(out);
+}
+
+async function strategy8_visibleInSections(page) {
+  // Видимые элементы (offsetParent) в секциях «Утро/Вечер», любые узлы
+  return await page.evaluate(() => {
+    const uniq = new Set();
+    const re = /\b(\d{1,2}):(\d{2})\b/;
+
+    const secBoxes = [];
+    [...document.querySelectorAll('body *')].forEach(el => {
+      const txt = (el.textContent||'').trim();
+      if (/^(Утро|Вечер)\s*$/i.test(txt)) {
+        const box = el.closest('*');
+        if (box && !secBoxes.includes(box)) secBoxes.push(box);
+      }
+    });
+
+    for (const box of secBoxes) {
+      [...box.querySelectorAll('*')].forEach(el => {
+        if (!el.offsetParent) return;
+        const t = (el.textContent||'').trim();
+        const m = t.match(re);
+        if (m) uniq.add(`${String(m[1]).padStart(2,'0')}:${m[2]}`);
+      });
     }
 
-    const times = await collectTimes(page, d.label);
-    if (times.length) result[d.label] = times;
+    return Array.from(uniq).sort((a,b)=>a.localeCompare(b));
+  });
+}
+
+async function strategy9_allVisibleNodes(page) {
+  // Все видимые узлы в модалке, без секционного ограничения (может шуметь)
+  return await page.evaluate(() => {
+    const uniq = new Set();
+    const re = /\b(\d{1,2}):(\d{2})\b/;
+    [...document.querySelectorAll('body *')].forEach(el => {
+      if (!el.offsetParent) return;
+      const t = (el.textContent||'').trim();
+      const m = t.match(re);
+      if (m) uniq.add(`${String(m[1]).padStart(2,'0')}:${m[2]}`);
+    });
+    return Array.from(uniq).sort((a,b)=>a.localeCompare(b));
+  });
+}
+
+async function strategy10_followingSiblings(page) {
+  // Находим заголовки «Утро/Вечер» и идём по их следующим блокам, собираем HH:MM
+  return await page.evaluate((SLOT_SEL_ARG) => {
+    const uniq = new Set();
+    const re = /\b(\d{1,2}):(\d{2})\b/;
+
+    const heads = [...document.querySelectorAll('body *')].filter(
+      el => /^(Утро|Вечер)\s*$/i.test((el.textContent||'').trim())
+    );
+
+    for (const h of heads) {
+      // контейнер под заголовком
+      let c = h.parentElement;
+      // safety
+      for (let i=0; i<3 && c; i++) {
+        // пробуем найти слоты под этим контейнером
+        const slots = c.querySelectorAll(SLOT_SEL_ARG);
+        if (slots.length) {
+          slots.forEach(el => {
+            const t = (el.textContent||'').trim();
+            const m = t.match(re);
+            if (m) uniq.add(`${String(m[1]).padStart(2,'0')}:${m[2]}`);
+          });
+          break;
+        }
+        c = c.nextElementSibling || c.parentElement;
+      }
+    }
+    return Array.from(uniq).sort((a,b)=>a.localeCompare(b));
+  }, SLOT_SEL);
+}
+
+// Собираем все стратегии подряд
+async function collectAllStrategies(page) {
+  const strategies = [
+    ['Метод 1 — SLOT_SEL', strategy1_SLOT_SEL],
+    ['Метод 2 — внутри секций', strategy2_scopedSections],
+    ['Метод 3 — текст в модалке', strategy3_textRegexInModal],
+    ['Метод 4 — ul:nth-child(2/4)+slot', strategy4_ul2_ul4_specific],
+    ['Метод 5 — locator.filter(hasText)', strategy5_locatorFilter],
+    ['Метод 6 — innerHTML regex', strategy6_innerHTMLRegex],
+    ['Метод 7 — slotDesktopWidth', strategy7_slotDesktopWidth],
+    ['Метод 8 — видимые в секциях', strategy8_visibleInSections],
+    ['Метод 9 — все видимые узлы', strategy9_allVisibleNodes],
+    ['Метод 10 — след. блоки от заголовков', strategy10_followingSiblings],
+  ];
+
+  const result = {};
+  for (const [name, fn] of strategies) {
+    try {
+      const arr = await fn(page);
+      result[name] = arr;
+    } catch (e) {
+      result[name] = [`[ошибка: ${String(e).slice(0,120)}]`];
+    }
   }
   return result;
+}
+
+// ---------- scrape выбранного дня ----------
+async function runOnOneDay(page) {
+  await clickThroughWizard(page);
+
+  // выбираем «первый нормальный» день (если есть — 11, иначе первый доступный)
+  const days = await findDayButtons(page);
+  log('📅 Кандидаты:', days.map(d=>d.label).join(', '));
+  const pick = days.find(d => d.label === '11') || days[0];
+  if (!pick) throw new Error('Нет кликабельных дней');
+
+  await pick.btn.scrollIntoViewIfNeeded().catch(()=>{});
+  await pick.btn.click({ timeout:1500 }).catch(()=>{});
+
+  // ждём фактическое выделение
+  for (let i=0;i<12;i++){
+    const selected = await getSelectedDayLabel(page);
+    if (selected === pick.label) break;
+    await page.waitForTimeout(120);
+  }
+  await page.waitForTimeout(250);
+
+  // немного прокрутки — чтобы точно отрисовались «Утро/Вечер»
+  await page.evaluate(()=>window.scrollBy(0, Math.round(window.innerHeight*0.35))).catch(()=>{});
+  await page.waitForTimeout(150);
+
+  // снимки на случай нулевого результата
+  await dump(page, `selected-${pick.label}`);
+
+  const all = await collectAllStrategies(page);
+  return { day: pick.label, all };
 }
 
 // ---------- main ----------
@@ -201,18 +383,24 @@ async function main() {
   log('🌐 Открываем сайт:', TARGET_URL);
   await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-  const all = await scrapeAll(page);
+  let body;
+  try {
+    const { day, all } = await runOnOneDay(page);
 
-  let text = '🎾 ТЕКУЩИЕ СЛОТЫ ЛУЖНИКИ\n\n';
-  const keys = Object.keys(all).sort((a,b)=>(+a)-(+b));
-  if (!keys.length) {
-    text += '(ничего не найдено)\n\n';
-  } else {
-    for (const k of keys) text += `📅 ${k}\n  ${all[k].join(', ')}\n\n`;
+    let text = `🎾 КАЛИБРОВКА СБОРА СЛОТОВ (день ${day})\n\n`;
+    for (const name of Object.keys(all)) {
+      const arr = all[name];
+      const line = Array.isArray(arr) ? arr.join(', ') : String(arr);
+      text += `${name} [${arr.length ?? 0}]: ${line || '(пусто)'}\n`;
+    }
+    text += `\n${TARGET_URL}#courts`;
+
+    body = text;
+  } catch (e) {
+    body = `Ошибка на шаге калибровки: ${String(e)}\n\n${TARGET_URL}#courts`;
   }
-  text += 'https://tennis.luzhniki.ru/#courts';
 
-  await sendTelegram(text);
+  await sendTelegram(body);
   log('✅ Сообщение отправлено.');
 
   await ctx.close();
