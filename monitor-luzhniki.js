@@ -1,4 +1,4 @@
-// --- Luzhniki Monitor — stable multi-day scrape (robust wizard + methods 1+4+5+7) ---
+// --- Luzhniki Monitor — robust multi-day scrape (skip disabled + verify selection + solid slots render) ---
 import playwright from 'playwright';
 import fetch from 'node-fetch';
 import proxyChain from 'proxy-chain';
@@ -69,7 +69,7 @@ async function sendTelegram(text) {
   if (!r.ok) throw new Error('Telegram ' + r.status + ' ' + (await r.text().catch(()=>'')));
 }
 
-// ---------- artifacts (для отладки) ----------
+// ---------- artifacts ----------
 async function dump(page, tag) {
   try {
     await fs.writeFile(`art-${tag}.html`, await page.content(), 'utf8');
@@ -87,7 +87,7 @@ async function launchBrowserWithProxy(raw) {
 
 // ---------- wizard (robust) ----------
 async function clickThroughWizard(page) {
-  // 1) Баннер (если виден)
+  // Баннер (если виден)
   const banner = page.locator('text=Аренда теннисных кортов').first();
   if (await banner.isVisible().catch(()=>false)) {
     await banner.click({ timeout: 20000 }).catch(()=>{});
@@ -95,16 +95,16 @@ async function clickThroughWizard(page) {
     await page.waitForTimeout(300);
   }
 
-  const deadline = Date.now() + 15000; // суммарно до ~15с на этап
+  const deadline = Date.now() + 15000;
   while (Date.now() < deadline) {
-    // Уже в календаре?
+    // Уже календарь?
     const anyDay = page.locator('button div:nth-child(2)').filter({ hasText: /^\d{1,2}$/ }).first();
     if (await anyDay.isVisible().catch(()=>false)) {
       log('➡️ Уже на экране календаря');
       break;
     }
 
-    // 2) Карточка «Крытые» несколькими способами
+    // Карточка «Крытые»
     const indoorByText = page.locator('text=/Аренда\\s+крытых\\s+кортов/i').first();
     const indoorCard =
       (await indoorByText.isVisible().catch(()=>false)) ? indoorByText :
@@ -121,7 +121,7 @@ async function clickThroughWizard(page) {
       await page.waitForTimeout(200);
     }
 
-    // 3) «Продолжить» — любым селектором
+    // «Продолжить»
     const cont = page
       .locator('button:has-text("Продолжить"), [role="button"]:has-text("Продолжить"), text=/^Продолжить$/')
       .first();
@@ -131,7 +131,7 @@ async function clickThroughWizard(page) {
       await page.waitForTimeout(400);
     }
 
-    // 4) Если всё ещё не календарь — мягкий фоллбек: прямой переход к /#courts
+    // Фоллбек в /#courts
     if (!(await anyDay.isVisible().catch(()=>false))) {
       await page.goto(COURTS_URL, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(()=>{});
       await page.waitForTimeout(400);
@@ -139,29 +139,40 @@ async function clickThroughWizard(page) {
       break;
     }
   }
-
-  // финальная маленькая пауза
   await page.waitForTimeout(250);
 }
 
 // ---------- days ----------
 async function findDayButtons(page) {
-  const divs = page.locator('button div:nth-child(2)');
-  const cnt = await divs.count().catch(() => 0);
+  // собираем только видимые и НЕ отключённые кнопки
+  const allBtns = page.locator('button');
+  const cnt = await allBtns.count().catch(()=>0);
   const list = [];
-  for (let i = 0; i < cnt; i++) {
-    const d = divs.nth(i);
-    const txt = (await d.innerText().catch(() => '')).trim();
-    if (!/^\d{1,2}$/.test(txt)) continue;
-    const btn = d.locator('xpath=ancestor::button[1]');
+  for (let i=0;i<cnt;i++) {
+    const btn = allBtns.nth(i);
+    // день — это кнопка, у которой второй див — число
+    const numDiv = btn.locator('div:nth-child(2)');
+    if (!(await numDiv.count().catch(()=>0))) continue;
+    const label = (await numDiv.innerText().catch(()=> '')).trim();
+    if (!/^\d{1,2}$/.test(label)) continue;
+
+    // фильтр отключённых
+    const disabled = (await btn.getAttribute('disabled').catch(()=>null)) !== null
+                  || (await btn.getAttribute('aria-disabled').catch(()=>null)) === 'true';
+    if (disabled) continue;
+
+    // видимость/возможность кликнуть
     if (!(await btn.isVisible().catch(()=>false)) || !(await btn.isEnabled().catch(()=>false))) continue;
+
     const bb = await btn.boundingBox().catch(()=>null);
     if (!bb) continue;
-    list.push({ label: txt, btn, x: bb.x });
+
+    list.push({ label, btn, x: bb.x });
   }
   list.sort((a,b)=>a.x-b.x);
   return list;
 }
+
 async function getSelectedDayLabel(page) {
   const sel = page.locator('button[class*="Selected"] div:nth-child(2)').first();
   const t = (await sel.innerText().catch(()=> '')).trim();
@@ -172,10 +183,28 @@ async function getSelectedDayLabel(page) {
 const TIMES_RE = /\b(\d{1,2}):(\d{2})\b/;
 const padTime = (h, m) => `${String(h).padStart(2,'0')}:${m}`;
 
+async function ensureSlotsRendered(page) {
+  // прокрутка к секциям и легкий “шевелёж”
+  await page.evaluate(()=>window.scrollTo({ top: 0 }));
+  await page.waitForTimeout(120);
+  const morning = page.locator('text=/^Утро$/i').first();
+  const evening = page.locator('text=/^Вечер$/i').first();
+  for (const sw of [morning, evening, morning]) {
+    if (await sw.isVisible().catch(()=>false)) {
+      await sw.scrollIntoViewIfNeeded().catch(()=>{});
+      await sw.click({ timeout: 300 }).catch(()=>{});
+      await page.waitForTimeout(90);
+    }
+  }
+  // дождаться появления хотя бы одного “слота” или текста HH:MM
+  await page.waitForSelector(`${SLOT_SEL}, text=/\\b\\d{1,2}:\\d{2}\\b/`, { timeout: 2000 }).catch(()=>{});
+  await page.waitForTimeout(120);
+}
+
 async function collectTimesCombined(page) {
   const out = new Set();
 
-  // Метод 1 — SLOT_SEL
+  // 1) SLOT_SEL
   {
     const els = await page.locator(SLOT_SEL).all().catch(()=>[]);
     for (const el of els) {
@@ -185,7 +214,7 @@ async function collectTimesCombined(page) {
     }
   }
 
-  // Метод 4 — ul:nth-child(2/4)+slot
+  // 4) ul:nth-child(2/4)+slot
   {
     for (const sel of ['ul:nth-child(2) '+SLOT_SEL, 'ul:nth-child(4) '+SLOT_SEL]) {
       const els = await page.locator(sel).all().catch(()=>[]);
@@ -197,7 +226,7 @@ async function collectTimesCombined(page) {
     }
   }
 
-  // Метод 5 — locator.filter(hasText)
+  // 5) locator.filter(hasText)
   {
     const els = await page.locator(SLOT_SEL).filter({ hasText: /:\d{2}/ }).all().catch(()=>[]);
     for (const el of els) {
@@ -207,7 +236,7 @@ async function collectTimesCombined(page) {
     }
   }
 
-  // Метод 7 — slotDesktopWidth
+  // 7) slotDesktopWidth
   {
     const els = await page.locator('[class*="slotDesktopWidth"]').all().catch(()=>[]);
     for (const el of els) {
@@ -241,31 +270,33 @@ async function scrapeAll(page) {
 
   const result = {};
   for (const d of days) {
-    await d.btn.scrollIntoViewIfNeeded().catch(()=>{});
-    await d.btn.click({ timeout: 1500 }).catch(()=>{});
-
-    // ждём реального выделения
-    for (let i=0; i<10; i++) {
+    // центрируем и кликаем
+    await d.btn.evaluate(el => el.scrollIntoView({ block: 'center' })).catch(()=>{});
+    await d.btn.click({ timeout: 1200 }).catch(()=>{});
+    // если не выделился — ещё раз через JS-Click
+    for (let i=0; i<8; i++) {
       const selected = await getSelectedDayLabel(page);
       if (selected === d.label) break;
+      if (i === 2) await d.btn.click({ timeout: 800, force: true }).catch(()=>{});
+      if (i === 5) await d.btn.evaluate(el => el.click()).catch(()=>{});
       await page.waitForTimeout(120);
     }
-    await page.waitForTimeout(220);
 
-    // «шевельнём» переключатели, если есть
-    for (const name of ['Утро','Вечер']) {
-      const sw = page.locator(`text=${name}`).first();
-      if (await sw.isVisible().catch(()=>false)) {
-        await sw.click({ timeout: 300 }).catch(()=>{});
-        await page.waitForTimeout(60);
-      }
+    // финальная проверка: если день так и не выделился — ПРОПУСК
+    const selectedFinal = await getSelectedDayLabel(page);
+    if (selectedFinal !== d.label) {
+      log(`↷ Пропускаем день ${d.label} — не выделился`);
+      continue;
     }
+
+    // гарантируем отрисовку секций и слотов
+    await ensureSlotsRendered(page);
 
     const times = await collectTimesCombined(page);
     if (times.length) {
       result[d.label] = times;
     } else {
-      await dump(page, `day-${d.label}`); // артефакты для отладки конкретного дня
+      await dump(page, `day-${d.label}`); // снимки для отладки точечно
     }
   }
 
