@@ -88,10 +88,19 @@ async function scrapeSlots(page) {
   log('✅ Клик по карточке «Аренда крытых кортов»');
 
   // 3️⃣ Кнопка «Продолжить»
-  const contBtn = page.locator('button:has-text("Продолжить"), text=Продолжить').first();
-  await contBtn.waitFor({ timeout: 20000 });
-  await contBtn.scrollIntoViewIfNeeded();
-  await contBtn.click();
+    const contBtn = page.locator('button:has-text("Продолжить")').first();
+  if (!(await contBtn.isVisible().catch(() => false))) {
+    // fallback: может быть <a> или <div>
+    const altBtn = page.locator('text=Продолжить').first();
+    await altBtn.waitFor({ timeout: 20000 });
+    log('⚠️ Альтернативный поиск кнопки «Продолжить»');
+    await altBtn.scrollIntoViewIfNeeded();
+    await altBtn.click({ timeout: 3000 }).catch(() => {});
+  } else {
+    await contBtn.waitFor({ timeout: 20000 });
+    await contBtn.scrollIntoViewIfNeeded();
+    await contBtn.click({ timeout: 3000 }).catch(() => {});
+  }
   log('✅ Нажали «Продолжить»');
 
   // 4️⃣ Календарь: ждём появление блока с месяцем
