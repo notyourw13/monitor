@@ -1,4 +1,4 @@
-// --- Luzhniki Monitor (any HH:MM, scroll-aware, all visible days) ---
+// --- Luzhniki Monitor (clickable days only + visible HH:MM only) ---
 import playwright from 'playwright';
 import fetch from 'node-fetch';
 import proxyChain from 'proxy-chain';
@@ -58,13 +58,13 @@ async function clickThroughWizard(page){
   if(await cont.isVisible().catch(()=>false)) await cont.click({ timeout:5000 });
   else await page.locator('text=Продолжить').first().click({ timeout:5000 }).catch(()=>{});
   log('✅ Продолжить');
-  await page.waitForTimeout(700);
+  await page.waitForTimeout(600);
 }
 
 // ---------- helpers ----------
 async function nudgeScroll(page){
   await page.evaluate(()=>{
-    window.scrollBy(0, Math.round(window.innerHeight*0.5));
+    window.scrollBy(0, Math.round(window.innerHeight*0.6));
     const els=[...document.querySelectorAll('*')];
     for(const el of els){
       const cs=getComputedStyle(el);
@@ -73,18 +73,30 @@ async function nudgeScroll(page){
       }
     }
   });
-  await page.waitForTimeout(250);
+  await page.waitForTimeout(200);
 }
 
-// ждём появления любого HH:MM в DOM
+// ждём появления любого HH:MM в DOM (видимого)
 async function waitAnyTimeVisible(page, timeout=4500){
-  await page.waitForFunction(
-    () => /\b\d{1,2}:\d{2}\b/.test(document.body?.innerText||''),
-    { timeout }
-  ).catch(()=>{});
+  await page.waitForFunction(()=>{
+    const re=/\b\d{1,2}:\d{2}\b/;
+    const nodes=[...document.querySelectorAll('button,span,div,li,p')];
+    const isVis=(el)=>{
+      const cs=getComputedStyle(el);
+      if(cs.display==='none'||cs.visibility==='hidden') return false;
+      const r=el.getClientRects?.(); if(!r||r.length===0) return false;
+      const rect=r[0];
+      return rect.bottom>0 && rect.top<window.innerHeight && rect.right>0 && rect.left<window.innerWidth;
+    };
+    for(const el of nodes){
+      if(!isVis(el)) continue;
+      if(re.test(el.textContent||'')) return true;
+    }
+    return false;
+  },{timeout}).catch(()=>{});
 }
 
-// ---------- time extraction (broad) ----------
+// ---------- time extraction (visible only) ----------
 async function collectTimes(page, dayLabel){
   await nudgeScroll(page);
   await waitAnyTimeVisible(page, 5000);
@@ -92,24 +104,32 @@ async function collectTimes(page, dayLabel){
   const times = await page.evaluate(()=>{
     const acc=new Set();
     const re=/\b(\d{1,2}):(\d{2})\b/g;
+    const isVis=(el)=>{
+      const cs=getComputedStyle(el);
+      if(cs.display==='none'||cs.visibility==='hidden') return false;
+      const r=el.getClientRects?.(); if(!r||r.length===0) return false;
+      const rect=r[0];
+      return rect.bottom>0 && rect.top<window.innerHeight && rect.right>0 && rect.left<window.innerWidth;
+    };
 
-    // 1) Все «слоты» по классам (CSS-модули)
+    // 1) слоты c CSS-модульными классами, но только видимые
     document.querySelectorAll(
       '[class^="time-slot-module__slot___"],[class*="time-slot-module__slot___"],' +
       '[class^="time-slot-module__slot__"],[class*="time-slot-module__slot__"]'
     ).forEach(el=>{
+      if(!isVis(el)) return;
       const txt=(el.textContent||'');
       let m; while((m=re.exec(txt))){ acc.add(m[1].padStart(2,'0')+':'+m[2]); }
     });
 
-    // 2) На всякий случай — ищем HH:MM вообще во всём расписании
-    // Ограничим поиск видимой областью (ускорение) — берём элементы в пределах viewport
-    const candidates=[...document.querySelectorAll('button,span,div,li,p')];
-    for(const el of candidates){
-      const rect=el.getBoundingClientRect?.();
-      if(rect && (rect.bottom<0 || rect.top>window.innerHeight)) continue;
-      const txt=(el.textContent||'');
-      let m; while((m=re.exec(txt))){ acc.add(m[1].padStart(2,'0')+':'+m[2]); }
+    // 2) общий fallback по видимым узлам
+    if(acc.size===0){
+      const cand=[...document.querySelectorAll('button,span,div,li,p')];
+      for(const el of cand){
+        if(!isVis(el)) continue;
+        const txt=(el.textContent||'');
+        let m; while((m=re.exec(txt))){ acc.add(m[1].padStart(2,'0')+':'+m[2]); }
+      }
     }
 
     return Array.from(acc).sort((a,b)=>a.localeCompare(b));
@@ -119,9 +139,9 @@ async function collectTimes(page, dayLabel){
   return times;
 }
 
-// ---------- day buttons ----------
+// ---------- day buttons (clickable only) ----------
 async function findDayButtons(page){
-  // цифра лежит в button > div:nth-child(2)
+  // цифра — во 2-м div внутри button
   const divs = page.locator('button div:nth-child(2)');
   const cnt = await divs.count().catch(()=>0);
   const list=[];
@@ -129,11 +149,21 @@ async function findDayButtons(page){
     const d = divs.nth(i);
     const txt = (await d.innerText().catch(()=>''))?.trim();
     if(!/^\d{1,2}$/.test(txt)) continue;
+
+    // подняться к ближайшей button
     const btn = d.locator('xpath=ancestor::button[1]');
-    if(await btn.isVisible().catch(()=>false)){
-      const bb = await btn.boundingBox().catch(()=>null);
-      if(bb) list.push({ label: txt, btn, x: bb.x });
-    }
+    const ok = await btn.isVisible().catch(()=>false);
+    const enabled = await btn.isEnabled().catch(()=>false);
+    if(!(ok && enabled)) continue;
+
+    const bb = await btn.boundingBox().catch(()=>null);
+    if(!bb) continue;
+
+    // дополнительная фильтрация: в вьюпорте и не aria-disabled
+    const ariaDisabled = await btn.getAttribute('aria-disabled').catch(()=>null);
+    if(ariaDisabled === 'true') continue;
+
+    list.push({ label: txt, btn, x: bb.x });
   }
   list.sort((a,b)=>a.x-b.x);
   return list;
@@ -143,13 +173,13 @@ async function findDayButtons(page){
 async function scrapeAll(page){
   await clickThroughWizard(page);
   const days = await findDayButtons(page);
-  log('📅 Дни:', days.map(d=>d.label).join(', '));
+  log('📅 Дни (кликабельные):', days.map(d=>d.label).join(', '));
 
   const result = {};
   for(const d of days){
     await d.btn.scrollIntoViewIfNeeded().catch(()=>{});
     await d.btn.click({ timeout:1500 }).catch(()=>{});
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(280);
 
     // щёлкнем переключатели, если есть (чтобы оба списка прогрузились)
     for(const name of ['Утро','Вечер']){
