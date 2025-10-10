@@ -139,17 +139,38 @@ async function scrapeSlots(page) {
     await page.waitForTimeout(700);
 
     // теперь ищем слоты времени
-    const timeNodes = await page.locator('ul:nth-child(2) .time-slot-module__slot__vBkE2').all();
-    const times = [];
-    for (const t of timeNodes) {
-      const txt = (await t.innerText().catch(() => '')).trim();
-      if (/^\d{1,2}:\d{2}$/.test(txt)) times.push(txt.padStart(5, '0'));
-    }
-    if (times.length) {
-      result[label] = [...new Set(times)].sort();
-      log(`⏰ День ${label}:`, result[label]);
-    }
+    // теперь ищем слоты времени (устойчиво к CSS-модулям)
+await page.waitForTimeout(300);
+// чуть прокрутим, вдруг «Вечер» вне вьюпорта
+await page.evaluate(() => window.scrollBy(0, Math.round(window.innerHeight * 0.5)));
+await page.waitForTimeout(200);
+
+const timesSet = new Set();
+
+// 1) CSS-модуль со стабильным префиксом
+for (const sel of [
+  '[class^="time-slot-module__slot__"]',
+  '[class*="time-slot-module__slot__"]',
+]) {
+  const els = await page.locator(sel).all().catch(() => []);
+  for (const el of els) {
+    const txt = (await el.innerText().catch(() => '')).trim();
+    if (/^\d{1,2}:\d{2}$/.test(txt)) timesSet.add(txt.padStart(5, '0'));
   }
+}
+
+// 2) На всякий случай – любой элемент, содержащий «HH:MM»
+const textEls = await page.locator('text=/^\\s*\\d{1,2}:\\d{2}\\s*$/').all().catch(() => []);
+for (const el of textEls) {
+  const txt = (await el.innerText().catch(() => '')).trim();
+  if (/^\d{1,2}:\d{2}$/.test(txt)) timesSet.add(txt.padStart(5, '0'));
+}
+
+const times = Array.from(timesSet).sort();
+if (times.length) {
+  result[label] = times;
+  log(`⏰ День ${label}:`, times);
+}
 
   return result;
 }
