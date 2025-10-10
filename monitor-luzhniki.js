@@ -1,4 +1,4 @@
-// --- Luzhniki Monitor (clickable days only + visible HH:MM only) ---
+// --- Luzhniki Monitor (verified day selection + visible HH:MM only) ---
 import playwright from 'playwright';
 import fetch from 'node-fetch';
 import proxyChain from 'proxy-chain';
@@ -76,7 +76,6 @@ async function nudgeScroll(page){
   await page.waitForTimeout(200);
 }
 
-// ждём появления любого HH:MM в DOM (видимого)
 async function waitAnyTimeVisible(page, timeout=4500){
   await page.waitForFunction(()=>{
     const re=/\b\d{1,2}:\d{2}\b/;
@@ -84,9 +83,9 @@ async function waitAnyTimeVisible(page, timeout=4500){
     const isVis=(el)=>{
       const cs=getComputedStyle(el);
       if(cs.display==='none'||cs.visibility==='hidden') return false;
-      const r=el.getClientRects?.(); if(!r||r.length===0) return false;
-      const rect=r[0];
-      return rect.bottom>0 && rect.top<window.innerHeight && rect.right>0 && rect.left<window.innerWidth;
+      const rects=el.getClientRects?.(); if(!rects||rects.length===0) return false;
+      const r=rects[0];
+      return r.bottom>0 && r.top<window.innerHeight && r.right>0 && r.left<window.innerWidth;
     };
     for(const el of nodes){
       if(!isVis(el)) continue;
@@ -107,12 +106,12 @@ async function collectTimes(page, dayLabel){
     const isVis=(el)=>{
       const cs=getComputedStyle(el);
       if(cs.display==='none'||cs.visibility==='hidden') return false;
-      const r=el.getClientRects?.(); if(!r||r.length===0) return false;
-      const rect=r[0];
-      return rect.bottom>0 && rect.top<window.innerHeight && rect.right>0 && rect.left<window.innerWidth;
+      const rects=el.getClientRects?.(); if(!rects||rects.length===0) return false;
+      const r=rects[0];
+      return r.bottom>0 && r.top<window.innerHeight && r.right>0 && r.left<window.innerWidth;
     };
 
-    // 1) слоты c CSS-модульными классами, но только видимые
+    // 1) слоты с модульными классами
     document.querySelectorAll(
       '[class^="time-slot-module__slot___"],[class*="time-slot-module__slot___"],' +
       '[class^="time-slot-module__slot__"],[class*="time-slot-module__slot__"]'
@@ -122,7 +121,7 @@ async function collectTimes(page, dayLabel){
       let m; while((m=re.exec(txt))){ acc.add(m[1].padStart(2,'0')+':'+m[2]); }
     });
 
-    // 2) общий fallback по видимым узлам
+    // 2) fallback — любые видимые узлы
     if(acc.size===0){
       const cand=[...document.querySelectorAll('button,span,div,li,p')];
       for(const el of cand){
@@ -139,7 +138,7 @@ async function collectTimes(page, dayLabel){
   return times;
 }
 
-// ---------- day buttons (clickable only) ----------
+// ---------- day buttons (build list first) ----------
 async function findDayButtons(page){
   // цифра — во 2-м div внутри button
   const divs = page.locator('button div:nth-child(2)');
@@ -150,7 +149,6 @@ async function findDayButtons(page){
     const txt = (await d.innerText().catch(()=>''))?.trim();
     if(!/^\d{1,2}$/.test(txt)) continue;
 
-    // подняться к ближайшей button
     const btn = d.locator('xpath=ancestor::button[1]');
     const ok = await btn.isVisible().catch(()=>false);
     const enabled = await btn.isEnabled().catch(()=>false);
@@ -159,34 +157,48 @@ async function findDayButtons(page){
     const bb = await btn.boundingBox().catch(()=>null);
     if(!bb) continue;
 
-    // дополнительная фильтрация: в вьюпорте и не aria-disabled
-    const ariaDisabled = await btn.getAttribute('aria-disabled').catch(()=>null);
-    if(ariaDisabled === 'true') continue;
-
     list.push({ label: txt, btn, x: bb.x });
   }
   list.sort((a,b)=>a.x-b.x);
   return list;
 }
 
+// возвращает «фактически выбранный» день (цифру в кружочке)
+async function getSelectedDayLabel(page){
+  const sel = page.locator('button[class*="Selected"] div:nth-child(2)').first();
+  const t = (await sel.innerText().catch(()=>''))?.trim();
+  return /^\d{1,2}$/.test(t) ? t : '';
+}
+
 // ---------- scrape ----------
 async function scrapeAll(page){
   await clickThroughWizard(page);
+
   const days = await findDayButtons(page);
-  log('📅 Дни (кликабельные):', days.map(d=>d.label).join(', '));
+  log('📅 Кандидаты:', days.map(d=>d.label).join(', '));
 
   const result = {};
-  for(const d of days){
-    await d.btn.scrollIntoViewIfNeeded().catch(()=>{});
-    await d.btn.click({ timeout:1500 }).catch(()=>{});
-    await page.waitForTimeout(280);
 
-    // щёлкнем переключатели, если есть (чтобы оба списка прогрузились)
+  for(const d of days){
+    // клик
+    await d.btn.scrollIntoViewIfNeeded().catch(()=>{});
+    const before = await getSelectedDayLabel(page);
+    await d.btn.click({ timeout:1500 }).catch(()=>{});
+    await page.waitForTimeout(220);
+
+    // проверяем, что реально выбрался именно этот день
+    const after = await getSelectedDayLabel(page);
+    if(after !== d.label){
+      // этот «день» не переключает выбор — считаем некликабельным
+      continue;
+    }
+
+    // раскрыть «Утро/Вечер» (если есть)
     for(const name of ['Утро','Вечер']){
       const sw = page.locator(`text=${name}`).first();
       if(await sw.isVisible().catch(()=>false)){
         await sw.click({ timeout:400 }).catch(()=>{});
-        await page.waitForTimeout(120);
+        await page.waitForTimeout(100);
       }
     }
 
