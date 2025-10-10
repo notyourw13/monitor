@@ -1,4 +1,4 @@
-// --- Luzhniki Monitor — robust multi-day scrape (skip disabled + verify selection + solid slots render) ---
+// --- Luzhniki Monitor — robust multi-day scrape (final patience tuning) ---
 import playwright from 'playwright';
 import fetch from 'node-fetch';
 import proxyChain from 'proxy-chain';
@@ -150,18 +150,15 @@ async function findDayButtons(page) {
   const list = [];
   for (let i=0;i<cnt;i++) {
     const btn = allBtns.nth(i);
-    // день — это кнопка, у которой второй див — число
     const numDiv = btn.locator('div:nth-child(2)');
     if (!(await numDiv.count().catch(()=>0))) continue;
     const label = (await numDiv.innerText().catch(()=> '')).trim();
     if (!/^\d{1,2}$/.test(label)) continue;
 
-    // фильтр отключённых
     const disabled = (await btn.getAttribute('disabled').catch(()=>null)) !== null
                   || (await btn.getAttribute('aria-disabled').catch(()=>null)) === 'true';
     if (disabled) continue;
 
-    // видимость/возможность кликнуть
     if (!(await btn.isVisible().catch(()=>false)) || !(await btn.isEnabled().catch(()=>false))) continue;
 
     const bb = await btn.boundingBox().catch(()=>null);
@@ -172,35 +169,43 @@ async function findDayButtons(page) {
   list.sort((a,b)=>a.x-b.x);
   return list;
 }
-
 async function getSelectedDayLabel(page) {
   const sel = page.locator('button[class*="Selected"] div:nth-child(2)').first();
   const t = (await sel.innerText().catch(()=> '')).trim();
   return /^\d{1,2}$/.test(t) ? t : '';
 }
 
-// ---------- slots (methods 1+4+5+7 объединённо) ----------
+// ---------- slots helpers ----------
 const TIMES_RE = /\b(\d{1,2}):(\d{2})\b/;
 const padTime = (h, m) => `${String(h).padStart(2,'0')}:${m}`;
 
+// усиленное ожидание рендера сетки со слотами
 async function ensureSlotsRendered(page) {
-  // прокрутка к секциям и легкий “шевелёж”
+  // в начало, лёгкие переключения, чтобы SPA перерисовала
   await page.evaluate(()=>window.scrollTo({ top: 0 }));
   await page.waitForTimeout(120);
-  const morning = page.locator('text=/^Утро$/i').first();
-  const evening = page.locator('text=/^Вечер$/i').first();
-  for (const sw of [morning, evening, morning]) {
+  const toggles = [page.locator('text=/^Утро$/i').first(), page.locator('text=/^Вечер$/i').first()];
+  for (const sw of toggles) {
     if (await sw.isVisible().catch(()=>false)) {
       await sw.scrollIntoViewIfNeeded().catch(()=>{});
-      await sw.click({ timeout: 300 }).catch(()=>{});
-      await page.waitForTimeout(90);
+      await sw.click({ timeout: 400 }).catch(()=>{});
+      await page.waitForTimeout(120);
     }
   }
-  // дождаться появления хотя бы одного “слота” или текста HH:MM
-  await page.waitForSelector(`${SLOT_SEL}, text=/\\b\\d{1,2}:\\d{2}\\b/`, { timeout: 2000 }).catch(()=>{});
-  await page.waitForTimeout(120);
+
+  // ждём секции с time-slot (ul/div), несколько попыток
+  const containerSel = 'ul[class*="time-slot"], div[class*="time-slot"]';
+  for (let i = 0; i < 4; i++) {
+    if (await page.locator(containerSel).first().isVisible().catch(()=>false)) break;
+    await page.waitForTimeout(800);
+  }
+
+  // финальная страховка — чуть прокручиваем и ждём
+  await page.evaluate(()=>window.scrollBy(0, window.innerHeight/3)).catch(()=>{});
+  await page.waitForTimeout(500);
 }
 
+// объединённый сбор методами 1+4+5+7
 async function collectTimesCombined(page) {
   const out = new Set();
 
@@ -246,7 +251,7 @@ async function collectTimesCombined(page) {
     }
   }
 
-  // лёгкий нудж, если 0
+  // если всё ещё пусто — небольшой нудж и повтор SLOT_SEL
   if (out.size === 0) {
     await page.evaluate(()=>window.scrollBy(0, Math.round(window.innerHeight*0.4))).catch(()=>{});
     await page.waitForTimeout(150);
@@ -273,7 +278,8 @@ async function scrapeAll(page) {
     // центрируем и кликаем
     await d.btn.evaluate(el => el.scrollIntoView({ block: 'center' })).catch(()=>{});
     await d.btn.click({ timeout: 1200 }).catch(()=>{});
-    // если не выделился — ещё раз через JS-Click
+
+    // ждём выделение (повторные попытки)
     for (let i=0; i<8; i++) {
       const selected = await getSelectedDayLabel(page);
       if (selected === d.label) break;
@@ -282,21 +288,22 @@ async function scrapeAll(page) {
       await page.waitForTimeout(120);
     }
 
-    // финальная проверка: если день так и не выделился — ПРОПУСК
+    // если не выделился — пропускаем
     const selectedFinal = await getSelectedDayLabel(page);
     if (selectedFinal !== d.label) {
       log(`↷ Пропускаем день ${d.label} — не выделился`);
       continue;
     }
 
-    // гарантируем отрисовку секций и слотов
+    // гарантируем отрисовку сетки и слотов
     await ensureSlotsRendered(page);
+    await page.waitForTimeout(600); // ДОП. пауза перед реальным сбором
 
     const times = await collectTimesCombined(page);
     if (times.length) {
       result[d.label] = times;
     } else {
-      await dump(page, `day-${d.label}`); // снимки для отладки точечно
+      await dump(page, `day-${d.label}`); // снимки для точечной отладки
     }
   }
 
