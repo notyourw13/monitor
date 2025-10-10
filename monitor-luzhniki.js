@@ -1,4 +1,4 @@
-// --- Luzhniki Monitor vFinal (robust slots) ---
+// --- Luzhniki Monitor vFinal (slots via UL 2 & 4 + class triple underscore) ---
 import playwright from 'playwright';
 import fetch from 'node-fetch';
 import proxyChain from 'proxy-chain';
@@ -84,11 +84,17 @@ async function launchBrowserWithProxy(rawProxy) {
   return { browser, browserProxy };
 }
 
-// ---------- scraping ----------
-async function scrapeSlots(page) {
-  log('⌛ Ждём появление карточки «Аренда крытых кортов»');
+// ---------- scraping helpers ----------
+async function clickThroughWizard(page) {
+  // баннер на главной
+  const banner = page.locator('text=Аренда теннисных кортов').first();
+  await banner.waitFor({ timeout: 20000 });
+  await banner.click({ timeout: 4000 });
+  log('✅ Клик по баннеру «Аренда теннисных кортов»');
+
+  // карточка "Крытые"
   await page.waitForSelector('text=Аренда крытых кортов', { timeout: 20000 });
-  await page.locator('text=Аренда крытых кортов').first().click({ timeout: 3000 });
+  await page.locator('text=Аренда крытых кортов').first().click({ timeout: 4000 });
   log('✅ Клик по карточке «Аренда крытых кортов»');
 
   // «Продолжить»
@@ -100,65 +106,97 @@ async function scrapeSlots(page) {
   }
   log('✅ Нажали «Продолжить»');
 
-  // небольшой дожидатель календаря
-  await page.waitForTimeout(1200);
+  await page.waitForTimeout(800);
+}
 
-  // Берём побольше кандидатов на дни и фильтруем по «чистому числу»
-  const dayButtons = await page.locator('button:nth-child(n), [role="button"]').all();
-  log('📅 Найдено кнопок-дней:', dayButtons.length);
+// Собираем времена строго из ul:nth-child(2) и ul:nth-child(4),
+// и плюс safety-слой: любые элементы с текстом HH:MM.
+async function collectTimesForCurrentDay(page) {
+  // ждём дорисовку
+  await page.waitForTimeout(250);
+
+  const times = await page.evaluate(() => {
+    const acc = new Set();
+    const re = /^\s*(\d{1,2}):(\d{2})\s*$/;
+
+    const pull = (root) => {
+      if (!root) return;
+      root.querySelectorAll('[class^="time-slot-module__slot___"], [class*="time-slot-module__slot___"]')
+        .forEach(el => {
+          const t = (el.textContent || '').trim();
+          const m = t.match(re);
+          if (m) acc.add(m[1].padStart(2, '0') + ':' + m[2]);
+        });
+    };
+
+    // именно эти два списка, как ты показал в Distill:
+    pull(document.querySelector('ul:nth-child(2)'));
+    pull(document.querySelector('ul:nth-child(4)'));
+
+    // fallback: любая видимая HH:MM (если вдруг разметка поменялась)
+    if (acc.size === 0) {
+      document.querySelectorAll('button, span, div, li').forEach(el => {
+        const t = (el.textContent || '').trim();
+        const m = t.match(re);
+        if (m) acc.add(m[1].padStart(2, '0') + ':' + m[2]);
+      });
+    }
+
+    return Array.from(acc).sort();
+  });
+
+  return times;
+}
+
+// ---------- main scraper ----------
+async function scrapeAll(page) {
+  await clickThroughWizard(page);
+
+  // небольшой скролл, чтобы оба списка (утро/вечер) попали в вьюпорт
+  await page.evaluate(() => window.scrollBy(0, Math.round(window.innerHeight * 0.33)));
+  await page.waitForTimeout(200);
+
+  // берём максимум кандидатов на «дни»
+  const dayCandidates = await page.locator('button:nth-child(n), [role="button"]').all();
+  log('📅 Найдено кнопок-дней:', dayCandidates.length);
 
   const result = {};
 
-  for (let i = 0; i < dayButtons.length; i++) {
-    const btn = dayButtons[i];
-    const label = (await btn.innerText().catch(() => '')).trim();
+  for (let i = 0; i < dayCandidates.length; i++) {
+    const el = dayCandidates[i];
+
+    // из некоторых селекторов дни — это button, но внутри ещё div с цифрой
+    // поэтому читаем текст и у button, и у ближайших детей
+    let label = (await el.innerText().catch(() => '')).trim();
+    if (!/^\d{1,2}$/.test(label)) {
+      try {
+        const childText = (await el.locator('div, span').first().innerText().catch(() => '')).trim();
+        if (/^\d{1,2}$/.test(childText)) label = childText;
+      } catch {}
+    }
     if (!/^\d{1,2}$/.test(label)) continue;
 
-    log('🗓 День', label, '— кликаем');
-    await btn.scrollIntoViewIfNeeded().catch(() => {});
-    await btn.click({ timeout: 3000 }).catch(() => {});
-    // календарь подгружает куски — даём времени дорисоваться
-    await page.waitForTimeout(800);
+    // кликаем день
+    await el.scrollIntoViewIfNeeded().catch(() => {});
+    await el.click({ timeout: 3000 }).catch(() => {});
+    await page.waitForTimeout(600);
 
-    // слегка проскроллим, чтобы подгрузились «Вечер» и т.п.
-    await page.evaluate(() => window.scrollBy(0, Math.round(window.innerHeight * 0.5)));
+    // на всякий случай — докрутим страницу
+    await page.evaluate(() => window.scrollBy(0, Math.round(window.innerHeight * 0.4)));
     await page.waitForTimeout(200);
 
-    // ждём появления хотя бы одного HH:MM (до 3.5с)
+    // ждём, что появится хотя бы один HH:MM (до 3с)
     await page.waitForFunction(() => {
       const re = /^\s*\d{1,2}:\d{2}\s*$/;
-      // элементы c CSS-модульными классами слотов
-      const els = document.querySelectorAll('[class^="time-slot-module__slot__"], [class*="time-slot-module__slot__"]');
-      for (const el of els) if (re.test(el.textContent || '')) return true;
-      // fallback: любой текст HH:MM в документе
-      return re.test(document.body.innerText || '');
-    }, { timeout: 3500 }).catch(() => {});
+      const root2 = document.querySelector('ul:nth-child(2)');
+      const root4 = document.querySelector('ul:nth-child(4)');
+      const has = (root) =>
+        !!root && !!Array.from(root.querySelectorAll('[class^="time-slot-module__slot___"], [class*="time-slot-module__slot___"]'))
+          .find(el => re.test((el.textContent || '').trim()));
+      return has(root2) || has(root4) || re.test(document.body.innerText || '');
+    }, { timeout: 3000 }).catch(() => {});
 
-    // собираем времена: и по классам, и по текстовому паттерну
-    const times = await page.evaluate(() => {
-      const acc = new Set();
-      const re = /^\s*(\d{1,2}):(\d{2})\s*$/;
-
-      // 1) CSS-модульные слоты
-      document.querySelectorAll('[class^="time-slot-module__slot__"], [class*="time-slot-module__slot__"]')
-        .forEach(el => {
-          const t = (el.textContent || '').trim();
-          const m = t.match(re);
-          if (m) acc.add(m[1].padStart(2, '0') + ':' + m[2]);
-        });
-
-      // 2) Текстовые узлы HH:MM на всякий случай
-      // (берём не весь body.innerText, а элементы, чтобы не поймать мусор)
-      document.querySelectorAll('button, span, div, li')
-        .forEach(el => {
-          const t = (el.textContent || '').trim();
-          const m = t.match(re);
-          if (m) acc.add(m[1].padStart(2, '0') + ':' + m[2]);
-        });
-
-      return Array.from(acc).sort();
-    });
-
+    const times = await collectTimesForCurrentDay(page);
     if (times.length) {
       result[label] = times;
       log(`⏰ День ${label}:`, times);
@@ -168,17 +206,17 @@ async function scrapeSlots(page) {
   return result;
 }
 
-// ---------- main ----------
+// ---------- program entry ----------
 async function main() {
   const start = Date.now();
 
-  // прокси
+  // pick any working proxy from PROXY_LIST
   let chosenProxy = null;
   if (PROXY_LIST) {
     const lines = PROXY_LIST.split(/\r?\n/).map(parseProxyLine).filter(Boolean);
     for (const p of lines) {
       try { await testProxyReachable(p); chosenProxy = p; break; }
-      catch { /* попробуем следующий */ }
+      catch { /* try next */ }
     }
   }
 
@@ -189,15 +227,8 @@ async function main() {
   log('🌐 Открываем сайт:', TARGET_URL);
   await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-  // баннер на главной
-  const banner = page.locator('text=Аренда теннисных кортов').first();
-  await banner.waitFor({ timeout: 15000 });
-  await banner.click({ timeout: 3000 });
-  log('✅ Клик по баннеру «Аренда теннисных кортов»');
+  const all = await scrapeAll(page);
 
-  const all = await scrapeSlots(page);
-
-  // сообщение
   let text = '🎾 ТЕКУЩИЕ СЛОТЫ ЛУЖНИКИ\n\n';
   const dayKeys = Object.keys(all);
   if (!dayKeys.length) {
