@@ -1,4 +1,4 @@
-// --- Luzhniki monitor: надёжные клики (баннер → крытые → Продолжить) + proxy-chain ---
+// --- Luzhniki monitor: сразу /#courts → «крытые» → «Продолжить» → слоты (proxy-chain) ---
 import fs from 'fs';
 import { chromium } from 'playwright';
 import proxyChain from 'proxy-chain';
@@ -10,7 +10,7 @@ const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || '';
 const TG_CHAT_ID   = process.env.TG_CHAT_ID   || '';
 const PROXY_URL    = (process.env.PROXY_URL || '').trim();
 const PROXY_LIST   = (process.env.PROXY_LIST || '').split(/[\n, ]+/).map(s=>s.trim()).filter(Boolean);
-const HOME_URL     = 'https://tennis.luzhniki.ru/';
+
 const COURTS_URL   = 'https://tennis.luzhniki.ru/#courts';
 
 const LOGFILE = `run-${Date.now()}.log`;
@@ -57,7 +57,7 @@ async function prepareBridge(){
   return { server:'', close: async()=>{} };
 }
 
-// ===== ARTIFACTS =====
+// ===== ARTЕFACTS =====
 async function snap(page, tag){
   try{ await page.screenshot({ path:`art-${tag}.png`, fullPage:true }); }catch{}
   try{ const html = await page.content(); await fs.promises.writeFile(`art-${tag}.html`, html); }catch{}
@@ -69,111 +69,64 @@ function moscowTodayISO(){
   return now.toISOString().slice(0,10);
 }
 
-// ===== NAV HELPERS =====
-async function acceptCookies(page){
-  const sels = [
-    'xpath=//button[contains(translate(normalize-space(.),"ПРИНЯТЬ","принять"),"принять")]',
-    'xpath=//button[contains(translate(normalize-space(.),"СОГЛАСЕН","согласен"),"согласен")]',
-    'xpath=//button[contains(translate(normalize-space(.),"OK","ok"),"ok")]'
-  ];
-  for(const s of sels){
-    const b = page.locator(s).first();
-    if(await b.isVisible().catch(()=>false)){ await b.click().catch(()=>{}); await page.waitForTimeout(200); break; }
-  }
-}
+// ====== UI helpers на /#courts ======
 
-async function ensureOnCourts(page) {
-  // если мы на главной — кликаем баннер «Аренда теннисных кортов», иначе идём напрямую
-  if (!/\/courts/i.test(page.url())) {
-    const btn = page.locator('xpath=//*[contains(normalize-space(.),"Аренда теннисных кортов")]').first();
-    if (await btn.isVisible().catch(() => false)) {
-      log('Нашли баннер «Аренда теннисных кортов», кликаем');
-      await btn.click({ timeout: 4000 }).catch(() => {});
-      await page.waitForTimeout(500);
-    }
-    if (!/\/courts/i.test(page.url())) {
-      log('Переходим напрямую на /#courts');
-      await page.goto(COURTS_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    }
-  }
-  await acceptCookies(page);
-  await snap(page,'after-courts-open');
-}
+/** Находим и раскрываем карточку «Аренда крытых кортов» */
+async function openCoveredCard(page){
+  // ждём появления текста «Аренда крытых кортов»
+  await page.waitForSelector('xpath=//*[contains(normalize-space(.),"Аренда крытых кортов")]', { timeout: 20000 });
+  // сам блок карточки
+  const card = page.locator('xpath=//*[contains(normalize-space(.),"Аренда крытых кортов")]/ancestor::*[self::section or self::div][1]').first();
 
-// ——— поиск карточки «Аренда крытых кортов» (в модалке/оверлее) ———
-async function openCovered(page){
-  // 1) ждём появление окна-выбора
-  await page.waitForTimeout(400);
-  // кандидаты на «крытые»
-  const candidates = [
-    // явные кнопки
-    'xpath=//button[contains(translate(normalize-space(.),"КРЫТ","крт"),"к")]',
-    // кликабельные блоки/плитки
-    'xpath=//*[self::button or @role="button" or self::a or self::div][contains(translate(normalize-space(.),"КРЫТ","крт"),"к")]',
-    // текстовая карточка
-    'xpath=//*[contains(normalize-space(.),"Аренда") and contains(translate(normalize-space(.),"КРЫТ","крт"),"к")]'
-  ];
-  for(const s of candidates){
-    const loc = page.locator(s).first();
-    if(await loc.isVisible().catch(()=>false)){
-      await loc.scrollIntoViewIfNeeded().catch(()=>{});
-      await loc.click({ timeout: 4000 }).catch(()=>{});
-      await page.waitForTimeout(250);
-      await snap(page,'after-covered-click');
-      return true;
-    }
-  }
-  return false;
-}
-
-async function clickContinue(page){
-  // иногда это <button>, иногда это ссылка-стилизованная кнопка
-  const btn = page.locator(
-    'xpath=//*[self::button or self::a][contains(normalize-space(.),"Продолжить")]'
-  ).first();
-
-  // подождём до 10с — контент грузится лениво
-  for(let i=0;i<20;i++){
-    if(await btn.isVisible().catch(()=>false)) break;
-    await page.waitForTimeout(500);
-  }
-
-  if(await btn.isVisible().catch(()=>false)){
-    await btn.scrollIntoViewIfNeeded().catch(()=>{});
-    await btn.click({ timeout: 4000 }).catch(()=>{});
-    await page.waitForTimeout(400);
-    await snap(page,'after-continue-click');
+  if (await card.isVisible().catch(()=>false)) {
+    // если есть плюс/минус справа — кликаем по нему для раскрытия
+    const toggler = card.locator('xpath=.//button | .//div[@role="button"] | .//span[contains(.,"+") or contains(.,"−") or contains(.,"-")]').first();
+    try { await toggler.click({ timeout: 1500 }); } catch {}
+    await card.click({ timeout: 2000 }).catch(()=>{}); // клик по самому блоку тоже ок
+    await page.waitForTimeout(300);
+    await snap(page,'covered-open');
     return true;
   }
   return false;
 }
 
-async function findCalendarRoot(page){
-  const sels = [
-    'xpath=//*[contains(@class,"calendar")]',
-    'xpath=//*[contains(normalize-space(.),"Утро") or contains(normalize-space(.),"Вечер")]/ancestor::*[self::section or self::div][1]',
-    'xpath=//main','xpath=//*'
-  ];
-  for(const s of sels){ const l = page.locator(s).first(); if(await l.isVisible().catch(()=>false)) return l; }
-  return page.locator('xpath=//*').first();
+/** Жмём кнопку «Продолжить» под карточками */
+async function pressContinue(page){
+  // ждём, она бывает не сразу в DOM
+  for(let i=0;i<24;i++){
+    const btn =
+      page.getByRole?.('button', { name: /продолжить/i }).first?.() ??
+      page.locator('xpath=//*[self::button or self::a][contains(normalize-space(.),"Продолжить")]').first();
+    if (await btn.isVisible().catch(()=>false)) {
+      await btn.scrollIntoViewIfNeeded().catch(()=>{});
+      await btn.click({ timeout: 4000 }).catch(()=>{});
+      await page.waitForTimeout(400);
+      await snap(page,'continue-click');
+      return true;
+    }
+    await page.waitForTimeout(500);
+  }
+  return false;
 }
-async function getDayButtons(root){
-  const nodes = await root.locator('xpath=.//*[self::button or @role="button"]').all();
+
+/** Пытаемся собрать кнопки календаря с датами (цифрами) */
+async function getDayButtonsAnywhere(page){
+  const nodes = await page.locator('xpath=//*[self::button or @role="button" or self::div]').all();
   const out = [];
-  for(const n of nodes){
+  for (const n of nodes){
     const t = (await n.innerText().catch(()=> '')).trim();
-    if(/^\d{1,2}$/.test(t)) out.push(n);
+    if (/^\d{1,2}$/.test(t)) out.push(n);
   }
   return out;
 }
-async function collectTimesFromPage(page){
+
+/** Собираем времена из секций «Утро/Вечер» */
+async function collectTimes(page){
   const sections = await page.locator('xpath=//*[contains(normalize-space(.),"Утро") or contains(normalize-space(.),"Вечер")]/ancestor::*[self::section or self::div][1]').all();
   const acc = new Set();
   for(const s of sections){
     const list = await s.evaluate(el =>
-      Array.from(el.querySelectorAll('*'))
-        .map(n => (n.textContent||'').trim())
-        .filter(t => /^\d{1,2}:\d{2}$/.test(t))
+      Array.from(el.querySelectorAll('*')).map(n => (n.textContent||'').trim()).filter(t => /^\d{1,2}:\d{2}$/.test(t))
     ).catch(()=>[]);
     list.forEach(t=>{
       const m=t.match(/^(\d{1,2}):(\d{2})$/);
@@ -190,57 +143,52 @@ async function collectTimesFromPage(page){
   return Array.from(acc).sort();
 }
 
-// ===== SCRAPE =====
-async function scrapeWizard(page){
-  await page.waitForLoadState('domcontentloaded', { timeout: 60_000 });
-  await ensureOnCourts(page);
+// ===== SCRAPE PIPELINE =====
+async function scrape(page){
+  // 1) переходим прямо на /#courts
+  await page.goto(COURTS_URL, { waitUntil:'domcontentloaded', timeout: 60000 });
+  await snap(page,'courts-opened');
 
-  // 1) кликаем «крытые»
-  const hasCovered = await openCovered(page);
-  if(!hasCovered){
-    await dumpOnError(page,'no-covered');
-    throw new Error('Не нашли карточку «Аренда крытых кортов»');
-  }
+  // 2) кликаем «Аренда крытых кортов»
+  const covered = await openCoveredCard(page);
+  if (!covered) { await dumpOnError(page,'no-covered'); throw new Error('Не нашли/не раскрыли «Аренда крытых кортов»'); }
 
-  // 2) жмём «Продолжить» (если есть)
-  const ok2 = await clickContinue(page);
-  if(!ok2) log('Кнопка «Продолжить» не найдена (возможно, шаг объединён)');
+  // 3) жмём «Продолжить»
+  const cont = await pressContinue(page);
+  if (!cont) log('Кнопка «Продолжить» не найдена (может быть объединённый шаг)');
 
-  // 3) ждём, пока появится расписание/слоты
+  // 4) ждём расписание и собираем слоты
   await page.waitForTimeout(800);
-  await page.waitForSelector('xpath=//*[contains(normalize-space(.),"Утро") or contains(normalize-space(.),"Вечер")]', { timeout: 20_000 }).catch(()=>{});
-  await snap(page,'after-wizard');
+  await page.waitForSelector('xpath=//*[contains(normalize-space(.),"Утро") or contains(normalize-space(.),"Вечер")]', { timeout: 20000 }).catch(()=>{});
+  await snap(page,'schedule');
 
-  const root = await findCalendarRoot(page);
-  let days = await getDayButtons(root);
-  if(!days.length) days = await getDayButtons(page.locator('xpath=//*'));
-  log('Найдено кнопок-дней:', days.length);
+  // Кнопки дней могут быть частично вне экрана — пролистаем горизонталь, если есть стрелки
+  const dayButtons = await getDayButtonsAnywhere(page);
+  log('Найдено кнопок-дней (грубый поиск):', dayButtons.length);
 
   const iso = moscowTodayISO();
-  const results = [];
+  const result = [];
 
-  if(!days.length){
-    const times = await collectTimesFromPage(page);
-    log(`Текущий день: слотов ${times.length}`);
-    if(!times.length) await dumpOnError(page, 'no-days');
-    results.push({ date: iso, times });
-    return results;
+  if (!dayButtons.length) {
+    const times = await collectTimes(page);
+    result.push({ date: iso, times });
+    return result;
   }
 
-  for(let i=0;i<Math.min(days.length,14);i++){
-    const btn = days[i];
-    const label = (await btn.innerText().catch(()=> '')).trim();
-    await btn.scrollIntoViewIfNeeded().catch(()=>{});
-    await btn.click({ timeout: 5000 }).catch(()=>{});
-    await page.waitForTimeout(400);
-    const times = await collectTimesFromPage(page);
-    log(`День ${label || i+1}: слотов ${times.length}`);
-    if(!times.length) await dumpOnError(page, `day-${String(label || i+1).padStart(2,'0')}`);
-    results.push({ date: iso, times });
+  for (let i=0; i<Math.min(dayButtons.length, 14); i++){
+    const b = dayButtons[i];
+    const label = (await b.innerText().catch(()=> '')).trim();
+    await b.scrollIntoViewIfNeeded().catch(()=>{});
+    await b.click({ timeout: 2000 }).catch(()=>{});
+    await page.waitForTimeout(300);
+    const times = await collectTimes(page);
+    log(`День ${label||i+1}: слотов ${times.length}`);
+    result.push({ date: iso, times });
   }
 
+  // агрегируем по дате
   const by = new Map();
-  for(const r of results){
+  for(const r of result){
     if(!by.has(r.date)) by.set(r.date, new Set());
     r.times.forEach(t => by.get(r.date).add(t));
   }
@@ -273,8 +221,7 @@ function formatMessage(rows){
     context = await browser.newContext({ locale:'ru-RU', timezoneId:'Europe/Moscow' });
     const page = await context.newPage();
 
-    await page.goto(HOME_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-    const rows = await scrapeWizard(page);
+    const rows = await scrape(page);
     const msg = formatMessage(rows);
     await sendTelegram(msg);
   }catch(e){
