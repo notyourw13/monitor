@@ -1,4 +1,4 @@
-// --- Luzhniki Monitor (clickable days only + robust times) ---
+// --- Luzhniki Monitor (days via button div:nth-child(2)) ---
 import playwright from 'playwright';
 import fetch from 'node-fetch';
 import proxyChain from 'proxy-chain';
@@ -41,15 +41,12 @@ async function launchBrowserWithProxy(raw){
   return { browser, server };
 }
 
-// ---------- helpers ----------
+// ---------- wizard ----------
 async function clickThroughWizard(page){
-  // баннер
   await page.locator('text=Аренда теннисных кортов').first().click({ timeout:20000 });
   log('✅ Баннер');
-  // «Крытые»
   await page.locator('text=Аренда крытых кортов').first().click({ timeout:20000 });
   log('✅ Крытые');
-  // «Продолжить»
   const cont = page.locator('button:has-text("Продолжить")').first();
   if(await cont.isVisible().catch(()=>false)) await cont.click({ timeout:5000 });
   else await page.locator('text=Продолжить').first().click({ timeout:5000 }).catch(()=>{});
@@ -57,27 +54,20 @@ async function clickThroughWizard(page){
   await page.waitForTimeout(700);
 }
 
-// тест на кликабельность: видимая, не disabled, и Playwright может «trial-кликнуть»
-async function isClickableDay(btn){
-  try{
-    const txt=(await btn.innerText()).trim();
-    if(!/^\d{1,2}$/.test(txt)) return false;
-    if(!(await btn.isVisible())) return false;
-    if(await btn.isDisabled().catch(()=>false)) return false;
-    await btn.click({ trial:true, timeout:150 }); // без реального клика
-    return true;
-  }catch{ return false; }
-}
-
-// собрать времена (через явные ul 2/4 + общий поиск HH:MM)
+// ---------- times ----------
 async function collectTimes(page){
-  await page.waitForTimeout(150);
+  await page.waitForTimeout(200);
   await page.evaluate(()=>window.scrollBy(0,Math.round(window.innerHeight*0.4)));
-  // дождёмся появления хотя бы одного HH:MM
+  // дождёмся хотя бы одного HH:MM
   await page.waitForFunction(()=>{
     const re=/^\s*\d{1,2}:\d{2}\s*$/;
-    const q=(root)=>!!root&&!!Array.from(root.querySelectorAll('[class^="time-slot-module__slot___"],[class*="time-slot-module__slot___"],[class^="time-slot-module__slot__"],[class*="time-slot-module__slot__"]')).find(el=>re.test((el.textContent||'').trim()));
-    return q(document.querySelector('ul:nth-child(2)'))||q(document.querySelector('ul:nth-child(4)'))||re.test(document.body?.innerText||'');
+    const q=(root)=>!!root&&!!Array.from(root.querySelectorAll(
+      '[class^="time-slot-module__slot___"],[class*="time-slot-module__slot___"],' +
+      '[class^="time-slot-module__slot__"],[class*="time-slot-module__slot__"]'
+    )).find(el=>re.test((el.textContent||'').trim()));
+    return q(document.querySelector('ul:nth-child(2)'))||
+           q(document.querySelector('ul:nth-child(4)'))||
+           re.test(document.body?.innerText||'');
   },{timeout:3500}).catch(()=>{});
 
   const times = await page.evaluate(()=>{
@@ -100,29 +90,38 @@ async function collectTimes(page){
   return times;
 }
 
-// ---------- scrape ----------
+// ---------- main scrape ----------
 async function scrapeAll(page){
   await clickThroughWizard(page);
 
-  // берём кандидатов и оставляем только реально кликабельные дни
-  const rawButtons = await page.locator('button').all();
-  const days = [];
-  for(const b of rawButtons){
-    if(await isClickableDay(b)) days.push(b);
+  // 1) найдём «кнопки-цифры» как второй див внутри кнопки
+  const numberDivs = page.locator('button div:nth-child(2)');
+  const count = await numberDivs.count().catch(()=>0);
+
+  const dayButtons = [];
+  for(let i=0;i<count;i++){
+    const div = numberDivs.nth(i);
+    const txt = (await div.innerText().catch(()=>''))?.trim();
+    if(!/^\d{1,2}$/.test(txt)) continue;
+    // подняться к ближайшей кнопке
+    const btn = div.locator('xpath=ancestor::button[1]');
+    if(await btn.isVisible().catch(()=>false)){
+      dayButtons.push({ label: txt, btn });
+    }
   }
-  // отсортируем по X-координате (слева направо)
+
+  // упорядочим слева-направо по x
   const withPos = [];
-  for(const b of days){
-    const txt=(await b.innerText()).trim();
-    const bb=await b.boundingBox().catch(()=>null);
-    if(bb) withPos.push({btn:b, label:txt, x:bb.x});
+  for(const d of dayButtons){
+    const bb = await d.btn.boundingBox().catch(()=>null);
+    if(bb) withPos.push({ ...d, x: bb.x });
   }
   withPos.sort((a,b)=>a.x-b.x);
 
-  log('📅 Кликабельные дни:', withPos.map(d=>d.label).join(', '));
+  log('📅 Дни:', withPos.map(d=>d.label).join(', ')); // должно быть 10..17
 
   const result = {};
-  // пройдёмся по всем найденным (их немного — как раз 8–10)
+  // пройдёмся по всем найденным (их немного)
   for(const d of withPos){
     await d.btn.scrollIntoViewIfNeeded().catch(()=>{});
     await d.btn.click({ timeout:1500 }).catch(()=>{});
@@ -130,10 +129,11 @@ async function scrapeAll(page){
     const times = await collectTimes(page);
     if(times.length) result[d.label]=times;
   }
+
   return result;
 }
 
-// ---------- main ----------
+// ---------- entry ----------
 async function main(){
   const start=Date.now();
 
@@ -164,6 +164,7 @@ async function main(){
 
   await sendTelegram(text);
   log('✅ Сообщение отправлено.');
+
   await ctx.close(); await browser.close();
   if(server?.startsWith('http://127.0.0.1:')){ try{ await proxyChain.closeAnonymizedProxy(server,true);}catch{} }
   log('⏱ Время выполнения:', ((Date.now()-start)/1000).toFixed(1)+'s');
