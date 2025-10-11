@@ -1,4 +1,4 @@
-// --- Luzhniki Monitor — robust multi-day scrape (final patience tuning) ---
+// --- Luzhniki Monitor — full schedule with inline diffs + failure alert ---
 import playwright from 'playwright';
 import fetch from 'node-fetch';
 import proxyChain from 'proxy-chain';
@@ -6,6 +6,7 @@ import httpProxyAgentPkg from 'http-proxy-agent';
 import httpsProxyAgentPkg from 'https-proxy-agent';
 import socksProxyAgentPkg from 'socks-proxy-agent';
 import fs from 'fs/promises';
+import path from 'path';
 
 const { chromium } = playwright;
 const { HttpProxyAgent }  = httpProxyAgentPkg;
@@ -14,15 +15,29 @@ const { SocksProxyAgent } = socksProxyAgentPkg;
 
 const TARGET_URL   = 'https://tennis.luzhniki.ru/';
 const COURTS_URL   = 'https://tennis.luzhniki.ru/#courts';
+
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || '';
 const TG_CHAT_ID   = process.env.TG_CHAT_ID   || '';
 const PROXY_LIST   = (process.env.PROXY_LIST || '').trim();
+
+const STATE_DIR  = '.cache';
+const STATE_FILE = path.join(STATE_DIR, 'luzhniki-state.json');
 
 const SLOT_SEL =
   '[class^="time-slot-module__slot___"],[class*="time-slot-module__slot___"],' +
   '[class^="time-slot-module__slot__"],[class*="time-slot-module__slot__"]';
 
+const TIMES_RE = /\b(\d{1,2}):(\d{2})\b/;
 const log = (...a) => console.log(new Date().toISOString(), ...a);
+
+// ---------- utils ----------
+const htmlEscape = (s) =>
+  String(s)
+    .replaceAll('&','&amp;')
+    .replaceAll('<','&lt;')
+    .replaceAll('>','&gt;');
+
+const padTime = (h, m) => `${String(h).padStart(2,'0')}:${m}`;
 
 // ---------- proxy ----------
 function parseProxyLine(line) {
@@ -56,12 +71,11 @@ async function testProxyReachable(u) {
 }
 
 // ---------- telegram ----------
-async function sendTelegram(text) {
+async function sendTelegram(textHtml) {
   if (!TG_BOT_TOKEN || !TG_CHAT_ID) {
-    log('TG creds missing; printing message:\n' + text);
+    log('TG creds missing; printing message (HTML):\n' + textHtml);
     return;
   }
-
   const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
   const ids = TG_CHAT_ID.split(',').map(s => s.trim()).filter(Boolean);
 
@@ -72,7 +86,8 @@ async function sendTelegram(text) {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           chat_id: id,
-          text,
+          text: textHtml,
+          parse_mode: 'HTML',
           disable_web_page_preview: true,
         }),
       });
@@ -80,7 +95,7 @@ async function sendTelegram(text) {
         const body = await r.text().catch(() => '');
         log('⚠️ Ошибка Telegram для', id, r.status, body);
       } else {
-        log('✅ Сообщение успешно отправлено пользователю', id);
+        log('✅ Сообщение отправлено пользователю', id);
       }
     } catch (e) {
       log('⚠️ Исключение при отправке пользователю', id, e.message);
@@ -91,8 +106,9 @@ async function sendTelegram(text) {
 // ---------- artifacts ----------
 async function dump(page, tag) {
   try {
-    await fs.writeFile(`art-${tag}.html`, await page.content(), 'utf8');
-    await page.screenshot({ path: `art-${tag}.png`, fullPage: true });
+    await fs.mkdir(STATE_DIR, { recursive: true }).catch(()=>{});
+    await fs.writeFile(path.join(STATE_DIR, `art-${tag}.html`), await page.content(), 'utf8');
+    await page.screenshot({ path: path.join(STATE_DIR, `art-${tag}.png`), fullPage: true });
   } catch {}
 }
 
@@ -188,9 +204,7 @@ async function getSelectedDayLabel(page) {
   return /^\d{1,2}$/.test(t) ? t : '';
 }
 
-// ---------- slots helpers ----------
-const TIMES_RE = /\b(\d{1,2}):(\d{2})\b/;
-const padTime = (h, m) => `${String(h).padStart(2,'0')}:${m}`;
+// ---------- slots ----------
 async function ensureSlotsRendered(page) {
   await page.evaluate(()=>window.scrollTo({ top: 0 }));
   await page.waitForTimeout(120);
@@ -211,52 +225,52 @@ async function ensureSlotsRendered(page) {
   await page.waitForTimeout(500);
 }
 
-// ---------- collect slots ----------
 async function collectTimesCombined(page) {
   const out = new Set();
 
-  // 1) SLOT_SEL
+  // 1) универсальные time-slot-модули
   {
     const els = await page.locator(SLOT_SEL).all().catch(()=>[]);
     for (const el of els) {
       const t = (await el.innerText().catch(()=> '')).trim();
       const m = t.match(TIMES_RE);
-      if (m) out.add(`${m[1].padStart(2,'0')}:${m[2]}`);
+      if (m) out.add(padTime(m[1], m[2]));
     }
   }
 
-  // 4) ul:nth-child(2/4)+slot
+  // 2) явные контейнеры утро/вечер
   {
     for (const sel of ['ul:nth-child(2) '+SLOT_SEL, 'ul:nth-child(4) '+SLOT_SEL]) {
       const els = await page.locator(sel).all().catch(()=>[]);
       for (const el of els) {
         const t = (await el.innerText().catch(()=> '')).trim();
         const m = t.match(TIMES_RE);
-        if (m) out.add(`${m[1].padStart(2,'0')}:${m[2]}`);
+        if (m) out.add(padTime(m[1], m[2]));
       }
     }
   }
 
-  // 5) locator.filter(hasText)
+  // 3) фильтр по наличию «:мм»
   {
     const els = await page.locator(SLOT_SEL).filter({ hasText: /:\d{2}/ }).all().catch(()=>[]);
     for (const el of els) {
       const t = (await el.innerText().catch(()=> '')).trim();
       const m = t.match(TIMES_RE);
-      if (m) out.add(`${m[1].padStart(2,'0')}:${m[2]}`);
+      if (m) out.add(padTime(m[1], m[2]));
     }
   }
 
-  // 7) slotDesktopWidth
+  // 4) ширина для десктопа
   {
     const els = await page.locator('[class*="slotDesktopWidth"]').all().catch(()=>[]);
     for (const el of els) {
       const t = (await el.innerText().catch(()=> '')).trim();
       const m = t.match(TIMES_RE);
-      if (m) out.add(`${m[1].padStart(2,'0')}:${m[2]}`);
+      if (m) out.add(padTime(m[1], m[2]));
     }
   }
 
+  // повтор после лёгкого скролла, если пусто
   if (out.size === 0) {
     await page.evaluate(()=>window.scrollBy(0, Math.round(window.innerHeight*0.4))).catch(()=>{});
     await page.waitForTimeout(150);
@@ -264,7 +278,7 @@ async function collectTimesCombined(page) {
     for (const el of els) {
       const t = (await el.innerText().catch(()=> '')).trim();
       const m = t.match(TIMES_RE);
-      if (m) out.add(`${m[1].padStart(2,'0')}:${m[2]}`);
+      if (m) out.add(padTime(m[1], m[2]));
     }
   }
 
@@ -272,41 +286,109 @@ async function collectTimesCombined(page) {
 }
 
 // ---------- scrape ----------
+async function clickDayWithRetries(page, d) {
+  await d.btn.evaluate(el => el.scrollIntoView({ block: 'center' })).catch(()=>{});
+  await d.btn.click({ timeout: 1200 }).catch(()=>{});
+  for (let i=0; i<8; i++) {
+    const selected = await getSelectedDayLabel(page);
+    if (selected === d.label) return true;
+    if (i === 2) await d.btn.click({ timeout: 800, force: true }).catch(()=>{});
+    if (i === 5) await d.btn.evaluate(el => el.click()).catch(()=>{});
+    await page.waitForTimeout(120);
+  }
+  return false;
+}
+
 async function scrapeAll(page) {
   await clickThroughWizard(page);
   const days = await findDayButtons(page);
   log('📅 Дни (кликабельные):', days.map(d=>d.label).join(', '));
+
   const result = {};
   for (const d of days) {
-    await d.btn.evaluate(el => el.scrollIntoView({ block: 'center' })).catch(()=>{});
-    await d.btn.click({ timeout: 1200 }).catch(()=>{});
-    for (let i=0; i<8; i++) {
-      const selected = await getSelectedDayLabel(page);
-      if (selected === d.label) break;
-      if (i === 2) await d.btn.click({ timeout: 800, force: true }).catch(()=>{});
-      if (i === 5) await d.btn.evaluate(el => el.click()).catch(()=>{});
-      await page.waitForTimeout(120);
-    }
-    const selectedFinal = await getSelectedDayLabel(page);
-    if (selectedFinal !== d.label) {
-      log(`↷ Пропускаем день ${d.label} — не выделился`);
-      continue;
-    }
+    const ok = await clickDayWithRetries(page, d);
+    if (!ok) { log(`↷ Пропускаем день ${d.label} — не выделился`); continue; }
+
     await ensureSlotsRendered(page);
     await page.waitForTimeout(600);
+
     const times = await collectTimesCombined(page);
-    if (times.length) {
-      result[d.label] = times;
-    } else {
-      await dump(page, `day-${d.label}`);
-    }
+    result[d.label] = times; // даже если пусто — фиксируем состояние дня
   }
-  return result;
+  return result; // { '10': ['07:00','22:00'], ... }
+}
+
+// ---------- state (load/save) ----------
+async function loadPrevState() {
+  try {
+    const raw = await fs.readFile(STATE_FILE, 'utf8');
+    return JSON.parse(raw);
+  } catch {
+    return { ts: 0, data: {} };
+  }
+}
+async function saveState(data) {
+  await fs.mkdir(STATE_DIR, { recursive: true }).catch(()=>{});
+  const payload = { ts: Date.now(), data };
+  await fs.writeFile(STATE_FILE, JSON.stringify(payload, null, 2), 'utf8');
+  return payload;
+}
+
+// ---------- diff helpers ----------
+function calcDayDiff(prevArr = [], currArr = []) {
+  const prev = new Set(prevArr);
+  const curr = new Set(currArr);
+  const added = [...curr].filter(t => !prev.has(t));
+  const removed = [...prev].filter(t => !curr.has(t));
+  const unchanged = [...curr].filter(t => prev.has(t));
+  return { added: new Set(added), removed: new Set(removed), unchanged: new Set(unchanged) };
+}
+
+// ---------- formatting (FULL schedule with inline marks) ----------
+function formatFullWithInlineDiff(prevData, currData) {
+  const currDays = Object.keys(currData).map(Number).sort((a,b)=>a-b).map(String);
+  const goneDays = Object.keys(prevData).filter(d => !(d in currData)).map(Number).sort((a,b)=>a-b).map(String);
+
+  let out = '🎾 <b>ТЕКУЩИЕ СЛОТЫ ЛУЖНИКИ</b>\n\n';
+
+  // Основной блок: все текущие дни (с пометкой добавленных и пропавших таймов)
+  for (const day of currDays) {
+    const { added, removed, unchanged } = calcDayDiff(prevData[day], currData[day]);
+
+    // Объединяем для рендера: (curr ∪ removed)
+    const union = new Set([...currData[day], ...removed]);
+    const ordered = [...union].sort((a,b)=>a.localeCompare(b));
+
+    const pieces = ordered.map(t => {
+      if (added.has(t))     return `<u><b>${htmlEscape(t)}</b></u>`; // новое
+      if (removed.has(t))   return `<s>${htmlEscape(t)}</s>`;        // исчезло
+      if (unchanged.has(t)) return htmlEscape(t);                    // было и осталось
+      return htmlEscape(t);
+    });
+
+    out += `📅 <b>${htmlEscape(day)}</b>\n  ${pieces.join(', ')}\n\n`;
+  }
+
+  // Отдельный блок: полностью исчезнувшие дни
+  if (goneDays.length) {
+    out += '❌ <b>Исчезнувшие дни</b>\n';
+    for (const day of goneDays) {
+      const prevTimes = (prevData[day] || []).slice().sort((a,b)=>a.localeCompare(b));
+      const struck = prevTimes.length ? prevTimes.map(t => `<s>${htmlEscape(t)}</s>`).join(', ') : '<s>—</s>';
+      out += `  • ${htmlEscape(day)}: ${struck}\n`;
+    }
+    out += '\n';
+  }
+
+  out += htmlEscape(COURTS_URL);
+  return out;
 }
 
 // ---------- main ----------
 async function main() {
   const start = Date.now();
+
+  // выбираем рабочий прокси (если указан)
   let chosen = null;
   if (PROXY_LIST) {
     for (const p of PROXY_LIST.split(/\r?\n/).map(parseProxyLine).filter(Boolean)) {
@@ -314,31 +396,43 @@ async function main() {
     }
   }
 
+  const prev = await loadPrevState();
+
   const { browser, server } = await launchBrowserWithProxy(chosen);
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 1500 } });
   const page = await ctx.newPage();
 
-  log('🌐 Открываем сайт:', TARGET_URL);
-  await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  try {
+    log('🌐 Открываем сайт:', TARGET_URL);
+    await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-  let all = {};
-  try { all = await scrapeAll(page); } 
-  catch (e) { await dump(page, 'fatal'); throw e; }
+    const currData = await scrapeAll(page);
 
-  let text = '🎾 ТЕКУЩИЕ СЛОТЫ ЛУЖНИКИ\n\n';
-  const keys = Object.keys(all).sort((a,b)=>(+a)-(+b));
-  if (!keys.length) {
-    text += '(ничего не найдено)\n\n';
-  } else {
-    for (const k of keys) text += `📅 ${k}\n  ${all[k].join(', ')}\n\n`;
+    // Формируем «полный расклад с пометками изменений»
+    const msg = formatFullWithInlineDiff(prev.data || {}, currData);
+
+    // Сохраняем состояние всегда
+    await saveState(currData);
+
+    await sendTelegram(msg);
+    log('✅ Сообщение отправлено');
+
+  } catch (e) {
+    await dump(page, 'fatal');
+    const errMsg =
+      '❌ <b>Монитор сломался</b>\n' +
+      `<code>${htmlEscape(String(e && e.stack ? e.stack : e))}</code>\n\n` +
+      htmlEscape(COURTS_URL);
+    await sendTelegram(errMsg);
+    throw e;
+  } finally {
+    await ctx.close().catch(()=>{});
+    await browser.close().catch(()=>{});
+    if (server?.startsWith('http://127.0.0.1:')) {
+      try { await proxyChain.closeAnonymizedProxy(server, true); } catch {}
+    }
+    log('⏱ Время выполнения:', ((Date.now() - start) / 1000).toFixed(1) + 's');
   }
-  text += COURTS_URL;
-
-  await sendTelegram(text);
-  log('✅ Сообщение отправлено.');
-  await ctx.close(); await browser.close();
-  if (server?.startsWith('http://127.0.0.1:')) try { await proxyChain.closeAnonymizedProxy(server, true); } catch {}
-  log('⏱ Время выполнения:', ((Date.now() - start) / 1000).toFixed(1) + 's');
 }
 
 await main();
