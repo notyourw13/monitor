@@ -2,7 +2,7 @@ name: Luzhniki Monitor
 
 on:
   schedule:
-    - cron: "*/10 * * * *"  # каждые 10 минут
+    - cron: "*/10 * * * *"   # каждые 10 минут
   workflow_dispatch:
   push:
     branches: [ "main" ]
@@ -11,23 +11,30 @@ on:
       - "monitor-luzhniki.js"
       - "package.json"
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Кэш для файла состояния .cache/luzhniki-state.json, чтобы были диффы между запусками
+      - name: Cache state
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: luzhniki-state-${{ runner.os }}-v1
+          restore-keys: |
+            luzhniki-state-${{ runner.os }}-
+            luzhniki-state-
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: 'npm'
 
       - name: Install deps (ci if lockfile, otherwise i)
         run: |
@@ -43,17 +50,17 @@ jobs:
       - name: Run monitor
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          PROXY_URL: ${{ secrets.PROXY_URL }}
-          PROXY_LIST: ${{ secrets.PROXY_LIST }}
+          TG_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}   # можно перечислить несколько через запятую
+          PROXY_LIST:   ${{ secrets.PROXY_LIST }}   # ваш socks5://USER:PASS@HOST:PORT или список (по одному в строке)
         run: node monitor-luzhniki.js
 
-      - name: Upload artifacts (screenshots/HTML/trace)
+      - name: Upload artifacts (screens/HTML/logs) on fail or success
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: luzhniki-artifacts
           path: |
+            .cache/**
             art-*.png
             art-*.html
             run-*.log
