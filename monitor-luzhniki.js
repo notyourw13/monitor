@@ -1,4 +1,4 @@
-// --- Luzhniki Monitor — diffs only + error/heartbeat notify ---
+// --- Luzhniki Monitor — proxies rotation + weekday labels + robust scraping ---
 import playwright from 'playwright';
 import fetch from 'node-fetch';
 import proxyChain from 'proxy-chain';
@@ -6,7 +6,7 @@ import httpProxyAgentPkg from 'http-proxy-agent';
 import httpsProxyAgentPkg from 'https-proxy-agent';
 import socksProxyAgentPkg from 'socks-proxy-agent';
 import fs from 'fs/promises';
-import path from 'path';
+import { URL as NodeURL } from 'url';
 
 const { chromium } = playwright;
 const { HttpProxyAgent }  = httpProxyAgentPkg;
@@ -19,22 +19,13 @@ const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || '';
 const TG_CHAT_ID   = process.env.TG_CHAT_ID   || '';
 const PROXY_LIST   = (process.env.PROXY_LIST || '').trim();
 
-// Поведение уведомлений
-const ALWAYS_NOTIFY        = process.env.ALWAYS_NOTIFY === '1';   // форсить сообщение всегда
-const HEARTBEAT_MIN        = Number(process.env.HEARTBEAT_MIN || '0'); // «пульс» в минутах (0 — выключен)
-const DEBUG_LOG_HTML       = process.env.DEBUG_HTML === '1';      // сохранять art-*.html/png чаще
-
-// Путь к состоянию (кэшируем в Actions)
-const STATE_DIR  = '.cache';
-const STATE_FILE = path.join(STATE_DIR, 'luzhniki-state.json');
-
 const SLOT_SEL =
   '[class^="time-slot-module__slot___"],[class*="time-slot-module__slot___"],' +
   '[class^="time-slot-module__slot__"],[class*="time-slot-module__slot__"]';
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
-/* ---------------- proxy ---------------- */
+// ---------- proxy helpers ----------
 function parseProxyLine(line) {
   const s = line.trim();
   if (!s) return null;
@@ -49,30 +40,43 @@ function buildFetchAgent(u) {
   if (u.startsWith('socks5://')) return new SocksProxyAgent(u);
   return undefined;
 }
-async function testProxyReachable(u) {
+function printableProxy(u) {
+  if (!u) return 'без прокси';
+  try {
+    const p = new NodeURL(u.includes('://') ? u : 'http://' + u);
+    const host = p.hostname || '';
+    const port = p.port ? `:${p.port}` : '';
+    const scheme = p.protocol ? p.protocol.replace(':','') : 'http';
+    return `${scheme}://${host}${port}`;
+  } catch {
+    return u;
+  }
+}
+async function testProxyReachable(u, timeoutMs = 5000) {
   const agent = buildFetchAgent(u);
   const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 6000);
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const r = await fetch('https://ifconfig.me/all.json', { agent, signal: ctrl.signal });
+    const r = await fetch('https://ifconfig.me/ip', { agent, signal: ctrl.signal });
     clearTimeout(t);
     if (!r.ok) throw new Error('status ' + r.status);
-    const j = await r.json();
-    return j.ip_addr || 'ok';
+    const ip = (await r.text()).trim();
+    return ip || 'ok';
   } catch (e) {
     clearTimeout(t);
     throw e;
   }
 }
 
-/* ---------------- telegram ---------------- */
+// ---------- telegram ----------
 async function sendTelegram(text) {
   if (!TG_BOT_TOKEN || !TG_CHAT_ID) {
-    log('TG creds missing; printing:\n' + text);
+    log('TG creds missing; printing message:\n' + text);
     return;
   }
   const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
   const ids = TG_CHAT_ID.split(',').map(s => s.trim()).filter(Boolean);
+
   for (const id of ids) {
     try {
       const r = await fetch(url, {
@@ -81,30 +85,30 @@ async function sendTelegram(text) {
         body: JSON.stringify({
           chat_id: id,
           text,
-          parse_mode: 'HTML',              // чтобы работали <b>, <u>, <s>
           disable_web_page_preview: true,
         }),
       });
       if (!r.ok) {
         const body = await r.text().catch(() => '');
-        log('⚠️ Telegram error for', id, r.status, body);
+        log('⚠️ Ошибка Telegram для', id, r.status, body);
+      } else {
+        log('✅ Сообщение отправлено пользователю', id);
       }
     } catch (e) {
-      log('⚠️ Telegram exception for', id, e.message);
+      log('⚠️ Исключение при отправке пользователю', id, e.message);
     }
   }
 }
 
-/* ---------------- artifacts ---------------- */
+// ---------- artifacts ----------
 async function dump(page, tag) {
   try {
-    await fs.mkdir(STATE_DIR, { recursive: true });
     await fs.writeFile(`art-${tag}.html`, await page.content(), 'utf8');
     await page.screenshot({ path: `art-${tag}.png`, fullPage: true });
   } catch {}
 }
 
-/* ---------------- browser ---------------- */
+// ---------- browser ----------
 async function launchBrowserWithProxy(raw) {
   let server = null;
   if (raw) server = raw.startsWith('socks5://') ? await proxyChain.anonymizeProxy(raw) : raw;
@@ -112,7 +116,7 @@ async function launchBrowserWithProxy(raw) {
   return { browser, server };
 }
 
-/* ---------------- wizard (robust) ---------------- */
+// ---------- wizard (robust) ----------
 async function clickThroughWizard(page) {
   const banner = page.locator('text=Аренда теннисных кортов').first();
   if (await banner.isVisible().catch(()=>false)) {
@@ -125,7 +129,7 @@ async function clickThroughWizard(page) {
   while (Date.now() < deadline) {
     const anyDay = page.locator('button div:nth-child(2)').filter({ hasText: /^\d{1,2}$/ }).first();
     if (await anyDay.isVisible().catch(()=>false)) {
-      log('➡️ Уже календарь');
+      log('➡️ Уже на экране календаря');
       break;
     }
 
@@ -164,7 +168,7 @@ async function clickThroughWizard(page) {
   await page.waitForTimeout(250);
 }
 
-/* ---------------- days ---------------- */
+// ---------- days ----------
 async function findDayButtons(page) {
   const allBtns = page.locator('button');
   const cnt = await allBtns.count().catch(()=>0);
@@ -196,10 +200,8 @@ async function getSelectedDayLabel(page) {
   return /^\d{1,2}$/.test(t) ? t : '';
 }
 
-/* ---------------- slots helpers ---------------- */
+// ---------- slots helpers ----------
 const TIMES_RE = /\b(\d{1,2}):(\d{2})\b/;
-const pad = n => String(n).padStart(2,'0');
-
 async function ensureSlotsRendered(page) {
   await page.evaluate(()=>window.scrollTo({ top: 0 }));
   await page.waitForTimeout(120);
@@ -219,7 +221,6 @@ async function ensureSlotsRendered(page) {
   await page.evaluate(()=>window.scrollBy(0, window.innerHeight/3)).catch(()=>{});
   await page.waitForTimeout(500);
 }
-
 async function collectTimesCombined(page) {
   const out = new Set();
 
@@ -229,10 +230,9 @@ async function collectTimesCombined(page) {
     for (const el of els) {
       const t = (await el.innerText().catch(()=> '')).trim();
       const m = t.match(TIMES_RE);
-      if (m) out.add(`${pad(m[1])}:${m[2]}`);
+      if (m) out.add(`${m[1].padStart(2,'0')}:${m[2]}`);
     }
   }
-
   // 4) ul:nth-child(2/4)+slot
   {
     for (const sel of ['ul:nth-child(2) '+SLOT_SEL, 'ul:nth-child(4) '+SLOT_SEL]) {
@@ -240,31 +240,28 @@ async function collectTimesCombined(page) {
       for (const el of els) {
         const t = (await el.innerText().catch(()=> '')).trim();
         const m = t.match(TIMES_RE);
-        if (m) out.add(`${pad(m[1])}:${m[2]}`);
+        if (m) out.add(`${m[1].padStart(2,'0')}:${m[2]}`);
       }
     }
   }
-
   // 5) locator.filter(hasText)
   {
     const els = await page.locator(SLOT_SEL).filter({ hasText: /:\d{2}/ }).all().catch(()=>[]);
     for (const el of els) {
       const t = (await el.innerText().catch(()=> '')).trim();
       const m = t.match(TIMES_RE);
-      if (m) out.add(`${pad(m[1])}:${m[2]}`);
+      if (m) out.add(`${m[1].padStart(2,'0')}:${m[2]}`);
     }
   }
-
   // 7) slotDesktopWidth
   {
     const els = await page.locator('[class*="slotDesktopWidth"]').all().catch(()=>[]);
     for (const el of els) {
       const t = (await el.innerText().catch(()=> '')).trim();
       const m = t.match(TIMES_RE);
-      if (m) out.add(`${pad(m[1])}:${m[2]}`);
+      if (m) out.add(`${m[1].padStart(2,'0')}:${m[2]}`);
     }
   }
-
   if (out.size === 0) {
     await page.evaluate(()=>window.scrollBy(0, Math.round(window.innerHeight*0.4))).catch(()=>{});
     await page.waitForTimeout(150);
@@ -272,18 +269,49 @@ async function collectTimesCombined(page) {
     for (const el of els) {
       const t = (await el.innerText().catch(()=> '')).trim();
       const m = t.match(TIMES_RE);
-      if (m) out.add(`${pad(m[1])}:${m[2]}`);
+      if (m) out.add(`${m[1].padStart(2,'0')}:${m[2]}`);
     }
   }
-
   return Array.from(out).sort((a,b)=>a.localeCompare(b));
 }
 
-/* ---------------- scraping ---------------- */
+// ---------- calendar month/year & weekday label ----------
+const RU_MONTHS = {
+  'январь':0,'февраль':1,'март':2,'апрель':3,'май':4,'июнь':5,
+  'июль':6,'август':7,'сентябрь':8,'октябрь':9,'ноябрь':10,'декабрь':11,
+  'января':0,'февраля':1,'марта':2,'апреля':3,'мая':4,'июня':5,'июля':6,'августа':7,'сентября':8,'октября':9,'ноября':10,'декабря':11,
+};
+const RU_WD = ['вс','пн','вт','ср','чт','пт','сб'];
+
+async function getCalendarContext(page) {
+  // заголовок месяца где-то над лентой: обычно просто "Октябрь"
+  let monthText = (await page.locator('text=/^\\s*[А-Яа-я]+\\s*$/').first().innerText().catch(()=> '')).trim().toLowerCase();
+  // подстрахуемся: пробуем конкретные селекторы, если общая эвристика не сработала
+  if (!RU_MONTHS.hasOwnProperty(monthText)) {
+    for (const sel of ['[class*="Calendar"] h2', 'h2:has-text(/янв|фев|мар|апр|май|июн|июл|авг|сен|окт|ноя|дек/i)']) {
+      const t = (await page.locator(sel).first().innerText().catch(()=> '')).trim().toLowerCase();
+      if (RU_MONTHS.hasOwnProperty(t)) { monthText = t; break; }
+    }
+  }
+  const mIdx = RU_MONTHS.hasOwnProperty(monthText) ? RU_MONTHS[monthText] : (new Date()).getMonth();
+  const now = new Date();
+  // если на странице месяц "меньше" текущего более чем на 6, считаем, что это следующий год (декабрь→январь кейс)
+  let year = now.getFullYear();
+  if (mIdx < now.getMonth() - 6) year = now.getFullYear() + 1;
+  return { monthIndex: mIdx, year };
+}
+function dayLabelWithWeekday(dayNum, ctx) {
+  const d = new Date(ctx.year, ctx.monthIndex, Number(dayNum));
+  return `${dayNum}, ${RU_WD[d.getDay()]}`;
+}
+
+// ---------- scrape ----------
 async function scrapeAll(page) {
   await clickThroughWizard(page);
+  const ctx = await getCalendarContext(page);
   const days = await findDayButtons(page);
   log('📅 Дни (кликабельные):', days.map(d=>d.label).join(', '));
+
   const result = {};
   for (const d of days) {
     await d.btn.evaluate(el => el.scrollIntoView({ block: 'center' })).catch(()=>{});
@@ -304,81 +332,46 @@ async function scrapeAll(page) {
     await page.waitForTimeout(600);
     const times = await collectTimesCombined(page);
     if (times.length) {
-      result[d.label] = times;
-    } else if (DEBUG_LOG_HTML) {
+      result[dayLabelWithWeekday(d.label, ctx)] = times;
+    } else {
       await dump(page, `day-${d.label}`);
     }
   }
   return result;
 }
 
-/* ---------------- state & diff ---------------- */
-async function loadState() {
-  try {
-    const s = await fs.readFile(STATE_FILE, 'utf8');
-    return JSON.parse(s);
-  } catch {
-    return { lastNotifyAt: 0, data: {} };
-  }
-}
-async function saveState(state) {
-  await fs.mkdir(STATE_DIR, { recursive: true });
-  await fs.writeFile(STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
-}
-
-function asMap(arr) { const m = new Map(); for (const k of Object.keys(arr||{})) m.set(k, new Set(arr[k])); return m; }
-function diffStates(prevData, currData) {
-  const prev = asMap(prevData);
-  const curr = asMap(currData);
-  const days = new Set([...prev.keys(), ...curr.keys()]);
-  const changes = {};
-  let hasChanges = false;
-
-  for (const d of days) {
-    const p = prev.get(d) || new Set();
-    const c = curr.get(d) || new Set();
-    const added = [...c].filter(t => !p.has(t)).sort();
-    const removed = [...p].filter(t => !c.has(t)).sort();
-    if (added.length || removed.length) {
-      hasChanges = true;
-      changes[d] = { added, removed, now: [...c].sort() };
-    }
-  }
-  return { hasChanges, changes };
-}
-
-function renderMessageFromDiff(curr, diff) {
-  const dayKeys = Object.keys(curr).sort((a,b)=>(+a)-(+b));
-  let text = '🎾 ТЕКУЩИЕ СЛОТЫ ЛУЖНИКИ\n\n';
-  if (!dayKeys.length) {
-    text += '(ничего не найдено)\n\n' + COURTS_URL;
-    return text;
-  }
-  for (const d of dayKeys) {
-    const now = curr[d] || [];
-    const info = diff.changes[d] || { added: [], removed: [], now };
-    const add = new Set(info.added || []);
-    const rem = new Set(info.removed || []);
-    // объединим времена: всё из now + удалённые (чтобы показать зачёркнутые)
-    const union = Array.from(new Set([...now, ...rem])).sort((a,b)=>a.localeCompare(b));
-    const line = union.map(t => {
-      if (add.has(t)) return `<b><u>${t}</u></b>`;   // новое
-      if (rem.has(t)) return `<s>${t}</s>`;          // пропало
-      return t;                                      // было и осталось
-    }).join(', ');
-    text += `📅 ${d}\n  ${line || '(нет слотов)'}\n\n`;
-  }
-  text += COURTS_URL;
-  return text;
-}
-
-/* ---------------- main ---------------- */
+// ---------- main with proxy rotation & reporting ----------
 async function main() {
   const start = Date.now();
+
+  // подготовим список прокси и точку старта для ротации (меняем старт по времени)
+  const proxies = PROXY_LIST
+    ? PROXY_LIST.split(/\r?\n/).map(parseProxyLine).filter(Boolean)
+    : [];
+  const rotationStart = proxies.length ? (Math.floor(Date.now() / 600000) % proxies.length) : 0; // шаг ≈10 мин
+
   let chosen = null;
-  if (PROXY_LIST) {
-    for (const p of PROXY_LIST.split(/\r?\n/).map(parseProxyLine).filter(Boolean)) {
-      try { await testProxyReachable(p); chosen = p; break; } catch {}
+  let chosenPrintable = 'без прокси';
+
+  const tryOrder = [];
+  if (proxies.length) {
+    for (let i=0;i<proxies.length;i++) tryOrder.push(proxies[(rotationStart + i) % proxies.length]);
+  }
+  tryOrder.push(null); // в конце — без прокси как фоллбек
+
+  for (const candidate of tryOrder) {
+    try {
+      if (candidate) {
+        const ip = await testProxyReachable(candidate, 6000);
+        log('🔌 Прокси OK:', printableProxy(candidate), 'IP', ip);
+      } else {
+        log('🔌 Попытка без прокси');
+      }
+      chosen = candidate;
+      chosenPrintable = printableProxy(candidate);
+      break;
+    } catch (e) {
+      log('❌ Прокси не подошёл:', printableProxy(candidate), String(e));
     }
   }
 
@@ -386,66 +379,52 @@ async function main() {
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 1500 } });
   const page = await ctx.newPage();
 
+  log('🌐 Открываем сайт:', TARGET_URL);
   try {
-    log('🌐 Открываем сайт:', TARGET_URL);
     await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-
-    const current = await scrapeAll(page);                 // { '11': ['07:00', ...], ... }
-    const state   = await loadState();                     // { lastNotifyAt, data }
-    const isFirst = !Object.keys(state.data || {}).length;
-
-    // Дифф
-    const diff = diffStates(state.data || {}, current);
-
-    // Решаем, слать ли
-    let shouldNotify = false;
-    let reason = '';
-    if (ALWAYS_NOTIFY) { shouldNotify = true; reason = 'ALWAYS_NOTIFY'; }
-    else if (isFirst) { shouldNotify = true; reason = 'first run / baseline'; }
-    else if (diff.hasChanges) { shouldNotify = true; reason = 'changes detected'; }
-    else if (HEARTBEAT_MIN > 0) {
-      const now = Date.now();
-      if (now - (state.lastNotifyAt || 0) >= HEARTBEAT_MIN * 60_000) {
-        shouldNotify = true; reason = `heartbeat ${HEARTBEAT_MIN}m`;
-      }
-    }
-
-    if (shouldNotify) {
-      const text = diff.hasChanges
-        ? renderMessageFromDiff(current, diff)
-        : // «без изменений»: показываем текущий расклад без выделений, + пометка
-          (() => {
-            let t = '🎾 ТЕКУЩИЕ СЛОТЫ ЛУЖНИКИ\n\n';
-            const keys = Object.keys(current).sort((a,b)=>(+a)-(+b));
-            if (!keys.length) t += '(ничего не найдено)\n\n';
-            else for (const k of keys) t += `📅 ${k}\n  ${current[k].join(', ')}\n\n`;
-            t += `<i>без изменений (${reason})</i>\n` + COURTS_URL;
-            return t;
-          })();
-
-      await sendTelegram(text);
-      state.lastNotifyAt = Date.now();
-    } else {
-      log('ℹ️ Без изменений — уведомление не отправляли.');
-    }
-
-    // Сохраняем новое состояние
-    state.data = current;
-    await saveState(state);
-
-    await ctx.close(); await browser.close();
-    if (server?.startsWith('http://127.0.0.1:')) {
-      try { await proxyChain.closeAnonymizedProxy(server, true); } catch {}
-    }
-    log('⏱ Время выполнения:', ((Date.now() - start) / 1000).toFixed(1) + 's');
   } catch (e) {
-    // Ошибка: предупредим в TG и кинем артефакты
-    try {
-      await dump(page, 'fatal');
-      await sendTelegram(`⚠️ <b>Лужники монитор упал</b>\n<code>${String(e?.message || e)}</code>`);
-    } catch {}
+    await dump(page, 'goto-fail');
+    await sendTelegram(
+      `⚠️ Лужники монитор упал\n${String(e)}\n\nПрокси: ${chosenPrintable}`
+    );
     throw e;
   }
+
+  let all = {};
+  try {
+    all = await scrapeAll(page);
+  } catch (e) {
+    await dump(page, 'fatal');
+    await sendTelegram(
+      `⚠️ Лужники монитор упал\n${String(e)}\n\nПрокси: ${chosenPrintable}`
+    );
+    throw e;
+  }
+
+  // форматируем сообщение
+  let text = `🎾 ТЕКУЩИЕ СЛОТЫ ЛУЖНИКИ\n(прокси: ${chosenPrintable})\n\n`;
+  const keys = Object.keys(all).sort((a,b)=>{
+    // сортируем по числу дня слева от запятой
+    const da = Number(a.split(',')[0].trim());
+    const db = Number(b.split(',')[0].trim());
+    return da - db;
+  });
+  if (!keys.length) {
+    text += '(ничего не найдено)\n\n';
+  } else {
+    for (const k of keys) text += `📅 ${k}\n  ${all[k].join(', ')}\n\n`;
+  }
+  text += COURTS_URL;
+
+  await sendTelegram(text);
+  log('✅ Сообщение отправлено.');
+
+  await ctx.close();
+  await browser.close();
+  if (server?.startsWith('http://127.0.0.1:')) {
+    try { await proxyChain.closeAnonymizedProxy(server, true); } catch {}
+  }
+  log('⏱ Время выполнения:', ((Date.now() - start) / 1000).toFixed(1) + 's');
 }
 
 await main();
