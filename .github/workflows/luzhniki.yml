@@ -2,69 +2,60 @@ name: Luzhniki Monitor
 
 on:
   schedule:
-    - cron: "*/10 * * * *"  # каждые 10 минут
+    - cron: "*/15 * * * *"  # каждые 15 минут
   workflow_dispatch:
-  push:
-    branches: [ "main" ]
-    paths:
-      - ".github/workflows/luzhniki.yml"
-      - "monitor-luzhniki.js"
-      - "package.json"
 
 jobs:
-  run:
+  monitor:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          # cache: 'npm'   # ⚠️ НЕ ИСПОЛЬЗУЕМ без lock-файла
 
-      # Кэшируем состояние диффов (.cache/luzhniki-state.json)
-      - name: Restore state cache
-        id: cache-restore
-        uses: actions/cache/restore@v4
+      - name: Install dependencies
+        run: |
+          npm install playwright proxy-chain node-fetch http-proxy-agent https-proxy-agent socks-proxy-agent
+          npx playwright install chromium
+
+      # 🧠 Загрузка предыдущего состояния (если есть)
+      - name: Download previous state artifact (if any)
+        uses: dawidd6/action-download-artifact@v6
         with:
-          path: .cache
-          key: luzh-state-v1-${{ github.run_id }}
-          restore-keys: |
-            luzh-state-v1-
+          workflow_conclusion: success
+          name: luzhniki-state
+          path: state
+        continue-on-error: true
 
-      - name: Install deps
-        run: npm i
-
-      - name: Install Playwright Chromium + deps
-        run: npx playwright install --with-deps chromium
-
-      - name: Run monitor
+      - name: Run monitor script
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}   # можно перечислять через запятую
-          PROXY_LIST:   ${{ secrets.PROXY_LIST }}
-          HEARTBEAT_MIN: "0"       # пульс-уведомление раз в N минут (0 = выкл)
-          ALWAYS_NOTIFY: "0"       # 1 = всегда слать, для теста
-          DEBUG_HTML: "0"          # 1 = сохранять art-*.html/png чаще
-        run: node monitor-luzhniki.js
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          PROXY_LIST: ${{ secrets.PROXY_LIST }}
+        run: |
+          node monitor-luzhniki.js
 
-      - name: Save state cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: .cache
-          key: luzh-state-v1-${{ github.run_id }}
-
-      - name: Upload artifacts (screenshots/HTML)
+      # 📦 Сохраняем состояние, чтобы дифф работал при следующем запуске
+      - name: Upload state artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: luzhniki-artifacts
-          path: |
-            art-*.png
-            art-*.html
+          name: luzhniki-state
+          path: state/snapshot.json
           if-no-files-found: ignore
+
+      # (необязательно) Скриншоты или html-дампы для отладки
+      - name: Upload debug artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: luzhniki-debug
+          path: |
+            *.png
+            *.html
