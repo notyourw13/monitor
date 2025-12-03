@@ -1,4 +1,4 @@
-// --- Luzhniki Monitor — rotation + diff-only notify (HTML formatting) ---
+// --- Luzhniki Monitor — rotation + diff-only notify (HTML formatting, 2025-12 DOM) ---
 import playwright from 'playwright';
 import fetch from 'node-fetch';
 import proxyChain from 'proxy-chain';
@@ -22,11 +22,23 @@ const PROXY_LIST_ENV = (process.env.PROXY_LIST || '').trim();
 const STATE_DIR  = 'state';
 const STATE_FILE = path.join(STATE_DIR, 'snapshot.json');
 
-const SLOT_SEL =
-  '[class^="time-slot-module__slot___"],[class*="time-slot-module__slot___"],' +
-  '[class^="time-slot-module__slot__"],[class*="time-slot-module__slot__"]';
-
 const WEEKDAY_RU = ['вс','пн','вт','ср','чт','пт','сб']; // Date.getDay()
+
+// Новый корневой контейнер сетки слотов
+const WRAP_SEL =
+  '[class^="time-slots-module__wrapper___"],[class*="time-slots-module__wrapper___"],' +
+  '[class^="time-slots-module__wrapper__"],[class*="time-slots-module__wrapper__"]';
+
+// Селекторы «ячейки слота» в новой разметке
+const SLOT_CELL_SEL =
+  // новая «plural» ветка:
+  'li[class*="time-slots-module__slot"] ' +
+  // а внутри неё группа/контейнер с отдельными «пузырьками» времени:
+  ', [class*="time-slot-group-module__timeSlotGroup"], [class*="time-slot-group-module__timeSlotGroupContainer"] ' +
+  // плюс оставим старые резервные варианты:
+  ', [class^="time-slot-module__slot___"],[class*="time-slot-module__slot___"],' +
+  '[class^="time-slot-module__slot__"],[class*="time-slot-module__slot__"],' +
+  '[class*="slotDesktopWidth"]';
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
@@ -204,79 +216,85 @@ async function getSelectedDayLabel(page) {
 // ---------- slots helpers ----------
 const TIMES_RE = /\b(\d{1,2}):(\d{2})\b/;
 
-async function ensureSlotsRendered(page) {
-  await page.evaluate(()=>window.scrollTo({ top: 0 }));
-  await page.waitForTimeout(120);
-  const toggles = [page.locator('text=/^Утро$/i').first(), page.locator('text=/^Вечер$/i').first()];
-  for (const sw of toggles) {
-    if (await sw.isVisible().catch(()=>false)) {
-      await sw.scrollIntoViewIfNeeded().catch(()=>{});
-      await sw.click({ timeout: 400 }).catch(()=>{});
-      await page.waitForTimeout(120);
-    }
-  }
-  const containerSel = 'ul[class*="time-slot"], div[class*="time-slot"]';
-  for (let i = 0; i < 4; i++) {
-    if (await page.locator(containerSel).first().isVisible().catch(()=>false)) break;
-    await page.waitForTimeout(800);
-  }
-  await page.evaluate(()=>window.scrollBy(0, window.innerHeight/3)).catch(()=>{});
-  await page.waitForTimeout(500);
-}
-
 function normTime(txt) {
   const m = txt.match(TIMES_RE);
   if (!m) return null;
   return `${m[1].padStart(2,'0')}:${m[2]}`;
 }
 
+// Гарантируем отрисовку новой сетки (WRAP + списки слотов)
+async function ensureSlotsRendered(page) {
+  // ждём корневой wrapper
+  await page.waitForSelector(WRAP_SEL, { timeout: 10000 }).catch(()=>{});
+  // ждём хотя бы один список слотов (ul)
+  await page.waitForSelector(`${WRAP_SEL} ul[class*="time-slots-module__slots"]`, { timeout: 8000 }).catch(()=>{});
+
+  // лёгкая «раскачка» UI
+  await page.evaluate(()=>window.scrollTo({ top: 0, behavior: 'instant' })).catch(()=>{});
+  await page.waitForTimeout(120);
+
+  // кликнем заголовки «Утро/Вечер», если интерактивны
+  for (const title of ['Утро','Вечер']) {
+    const h = page.locator(`${WRAP_SEL} h3:has-text("${title}")`).first();
+    if (await h.isVisible().catch(()=>false)) {
+      await h.scrollIntoViewIfNeeded().catch(()=>{});
+      await h.click({ timeout: 300 }).catch(()=>{});
+      await page.waitForTimeout(120);
+    }
+  }
+
+  // чуть-чуть прокрутим
+  await page.evaluate(()=>window.scrollBy(0, Math.round(window.innerHeight*0.35))).catch(()=>{});
+  await page.waitForTimeout(250);
+}
+
+// Сбор таймов под новую разметку с несколькими методами
 async function collectTimesCombined(page) {
   const out = new Set();
 
-  // 1) общий селектор
+  // A) Под контейнером WRAP — любые узлы с текстом HH:MM
   {
-    const els = await page.locator(SLOT_SEL).all().catch(()=>[]);
+    const container = page.locator(WRAP_SEL).first();
+    const els = await container.locator('text=/\\b\\d{1,2}:\\d{2}\\b/').all().catch(()=>[]);
     for (const el of els) {
       const t = (await el.innerText().catch(()=> '')).trim();
       const n = normTime(t);
       if (n) out.add(n);
     }
   }
-  // 2) явные секции (утро/вечер) по nth-child
+
+  // B) Ячейки/группы слотов
   {
-    for (const sel of ['ul:nth-child(2) '+SLOT_SEL, 'ul:nth-child(4) '+SLOT_SEL]) {
-      const els = await page.locator(sel).all().catch(()=>[]);
-      for (const el of els) {
-        const t = (await el.innerText().catch(()=> '')).trim();
-        const n = normTime(t);
-        if (n) out.add(n);
-      }
+    const els = await page.locator(`${WRAP_SEL} ${SLOT_CELL_SEL}`).all().catch(()=>[]);
+    for (const el of els) {
+      const t = (await el.innerText().catch(()=> '')).trim();
+      // такие innerText часто содержат «07:00 7 000 ₽» — вытащим время регэкспом
+      const n = normTime(t);
+      if (n) out.add(n);
     }
   }
-  // 3) фильтр по наличию «:MM»
+
+  // C) Внутри списков ul.time-slots-module__slots …
   {
-    const els = await page.locator(SLOT_SEL).filter({ hasText: /:\d{2}/ }).all().catch(()=>[]);
+    const els = await page.locator(`${WRAP_SEL} ul[class*="time-slots-module__slots"] >> text=/\\b\\d{1,2}:\\d{2}\\b/`).all().catch(()=>[]);
     for (const el of els) {
       const t = (await el.innerText().catch(()=> '')).trim();
       const n = normTime(t);
       if (n) out.add(n);
     }
   }
-  // 4) desktop width класс
-  {
-    const els = await page.locator('[class*="slotDesktopWidth"]').all().catch(()=>[]);
-    for (const el of els) {
-      const t = (await el.innerText().catch(()=> '')).trim();
-      const n = normTime(t);
-      if (n) out.add(n);
-    }
-  }
-  // страховочный повтор
+
+  // D) Резерв — поиск по всему модалке «строгих» узлов-времени
   if (out.size === 0) {
-    await page.evaluate(()=>window.scrollBy(0, Math.round(window.innerHeight*0.4))).catch(()=>{});
-    await page.waitForTimeout(150);
-    const els = await page.locator(SLOT_SEL).all().catch(()=>[]);
+    const els = await page.locator('text=/^\\s*\\d{1,2}:\\d{2}\\s*$/').all().catch(()=>[]);
     for (const el of els) {
+      // фильтруем только те, что лежат внутри WRAP
+      const ok = await el.evaluate((node, sel) => {
+        let p = node.parentElement;
+        while (p) { if (p.matches?.(sel)) return true; p = p.parentElement; }
+        return false;
+      }, WRAP_SEL).catch(()=>false);
+      if (!ok) continue;
       const t = (await el.innerText().catch(()=> '')).trim();
       const n = normTime(t);
       if (n) out.add(n);
@@ -312,6 +330,7 @@ async function scrapeAll(page) {
 
     await ensureSlotsRendered(page);
     await page.waitForTimeout(600);
+
     const times = await collectTimesCombined(page);
     if (times.length) result[d.label] = times;
     else await dump(page, `day-${d.label}`);
@@ -334,8 +353,19 @@ async function saveState(obj) {
 }
 
 // ---------- diff formatting ----------
+function weekdayForDay(dayStr) {
+  const today = new Date();
+  const dNum = Number(dayStr);
+  let month = today.getMonth();
+  let year = today.getFullYear();
+  if (dNum < today.getDate()) {
+    month = (month + 1) % 12;
+    if (month === 0) year += 1;
+  }
+  const dt = new Date(year, month, dNum);
+  return WEEKDAY_RU[dt.getDay()];
+}
 function diffSchedules(prev, curr) {
-  // prev/curr: { dayLabel: ['07:00','22:00'] }
   const allDays = Array.from(new Set([...Object.keys(prev), ...Object.keys(curr)]))
     .map(Number).sort((a,b)=>a-b).map(String);
 
@@ -351,55 +381,38 @@ function diffSchedules(prev, curr) {
 
     if (added.length || removed.length) hasChange = true;
 
-    // подпись дня + будни
     const wd = weekdayForDay(d);
     lines.push(`📅 ${d}, ${wd}`);
 
     const parts = [];
-    if (kept.length)   parts.push(...kept);
+    if (kept.length)    parts.push(...kept);
     if (removed.length) parts.push(...removed.map(t => `<s>${t}</s>`));
     if (added.length)   parts.push(...added.map(t => `<u><b>${t}</b></u>`));
 
     lines.push(parts.length ? `  ${parts.join(', ')}` : '  (пусто)');
-    lines.push(''); // пустая строка
+    lines.push('');
   }
 
   return { hasChange, text: lines.join('\n') };
-}
-
-// Вытаскиваем день недели для «числа месяца» (берём текущий/след. месяц как сейчас на сайте)
-function weekdayForDay(dayStr) {
-  // Пробуем вычислить относительно «сегодня» — если число меньше сегодня, считаем, что это след. месяц
-  const today = new Date();
-  const dNum = Number(dayStr);
-  let month = today.getMonth();
-  let year = today.getFullYear();
-  if (dNum < today.getDate()) {
-    month = (month + 1) % 12;
-    if (month === 0) year += 1;
-  }
-  const dt = new Date(year, month, dNum);
-  return WEEKDAY_RU[dt.getDay()];
 }
 
 // ---------- main ----------
 async function main() {
   const start = Date.now();
 
-  // 1) собираем список прокси и перемешиваем для ротации без памяти
+  // ротация прокси: перемешаем список каждый запуск
   const fromEnv = PROXY_LIST_ENV
     ? PROXY_LIST_ENV.split(/\r?\n/).map(parseProxyLine).filter(Boolean)
     : [];
-  const candidates = shuffle(fromEnv); // <— здесь и есть «ротация»
+  const candidates = shuffle(fromEnv);
 
-  // проверяем прокси и выбираем рабочий
   const probeResults = [];
   let chosenProxy = null;
   for (const p of candidates) {
     try {
       const ip = await testProxyReachable(p);
       probeResults.push(`✔ ${p} (${ip})`);
-      if (!chosenProxy) chosenProxy = p;
+      if (!chosenProxy) chosenProxy = p; // первый успешно отвечающий
     } catch (e) {
       probeResults.push(`✖ ${p} (${e.message || String(e)})`);
     }
@@ -409,31 +422,26 @@ async function main() {
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 1500 } });
   const page = await ctx.newPage();
 
-  let usedProxyNote = chosenProxy ? chosenProxy : 'без прокси';
+  const usedProxyNote = chosenProxy ? chosenProxy : 'без прокси';
 
   try {
     log('🌐 Открываем сайт:', TARGET_URL);
     await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
     const current = await scrapeAll(page);
-
-    // загрузим старое состояние
     const prev = await loadPrevState();
 
-    // дифф
     const { hasChange, text: diffText } = diffSchedules(prev, current);
 
-    // если изменений нет — ничего не шлём
-    if (!hasChange) {
-      log('ℹ️ Изменений нет — уведомление не отправляем.');
-    } else {
+    if (hasChange) {
       let msg = '🎾 ТЕКУЩИЕ СЛОТЫ ЛУЖНИКИ (изменения)\n\n';
       msg += diffText;
       msg += `\n${COURTS_URL}\n\nПрокси: ${usedProxyNote}\n\nПроверка прокси:\n` + (probeResults.join('\n') || '—');
-      await sendTelegram(msg, true /* HTML */);
+      await sendTelegram(msg, true);
+    } else {
+      log('ℹ️ Изменений нет — уведомление не отправляем.');
     }
 
-    // Всегда сохраняем текущее в state
     await saveState(current);
 
     await ctx.close();
