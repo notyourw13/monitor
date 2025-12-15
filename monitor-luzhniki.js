@@ -1,4 +1,5 @@
 // --- Luzhniki Monitor — rotation + diff-only notify (HTML formatting, 2025-12 DOM) ---
+// Fixes: proxy retry on tunnel/proxy/network errors + robust dump artifacts
 import playwright from 'playwright';
 import fetch from 'node-fetch';
 import proxyChain from 'proxy-chain';
@@ -31,11 +32,8 @@ const WRAP_SEL =
 
 // Селекторы «ячейки слота» в новой разметке
 const SLOT_CELL_SEL =
-  // новая «plural» ветка:
   'li[class*="time-slots-module__slot"] ' +
-  // а внутри неё группа/контейнер с отдельными «пузырьками» времени:
   ', [class*="time-slot-group-module__timeSlotGroup"], [class*="time-slot-group-module__timeSlotGroupContainer"] ' +
-  // плюс оставим старые резервные варианты:
   ', [class^="time-slot-module__slot___"],[class*="time-slot-module__slot___"],' +
   '[class^="time-slot-module__slot__"],[class*="time-slot-module__slot__"],' +
   '[class*="slotDesktopWidth"]';
@@ -115,8 +113,12 @@ async function sendTelegram(text, html = false) {
 
 // ---------- artifacts ----------
 async function dump(page, tag) {
+  // важно: разнести html/png, чтобы хотя бы что-то сохранялось
   try {
-    await fs.writeFile(`art-${tag}.html`, await page.content(), 'utf8');
+    const html = await page.content();
+    await fs.writeFile(`art-${tag}.html`, html, 'utf8');
+  } catch {}
+  try {
     await page.screenshot({ path: `art-${tag}.png`, fullPage: true });
   } catch {}
 }
@@ -127,6 +129,13 @@ async function launchBrowserWithProxy(raw) {
   if (raw) server = raw.startsWith('socks5://') ? await proxyChain.anonymizeProxy(raw) : raw;
   const browser = await chromium.launch({ headless: true, proxy: server ? { server } : undefined });
   return { browser, server };
+}
+async function safeClose(browser, ctx, server) {
+  try { await ctx?.close(); } catch {}
+  try { await browser?.close(); } catch {}
+  if (server?.startsWith('http://127.0.0.1:')) {
+    try { await proxyChain.closeAnonymizedProxy(server, true); } catch {}
+  }
 }
 
 // ---------- wizard (robust) ----------
@@ -224,16 +233,12 @@ function normTime(txt) {
 
 // Гарантируем отрисовку новой сетки (WRAP + списки слотов)
 async function ensureSlotsRendered(page) {
-  // ждём корневой wrapper
   await page.waitForSelector(WRAP_SEL, { timeout: 10000 }).catch(()=>{});
-  // ждём хотя бы один список слотов (ul)
   await page.waitForSelector(`${WRAP_SEL} ul[class*="time-slots-module__slots"]`, { timeout: 8000 }).catch(()=>{});
 
-  // лёгкая «раскачка» UI
   await page.evaluate(()=>window.scrollTo({ top: 0, behavior: 'instant' })).catch(()=>{});
   await page.waitForTimeout(120);
 
-  // кликнем заголовки «Утро/Вечер», если интерактивны
   for (const title of ['Утро','Вечер']) {
     const h = page.locator(`${WRAP_SEL} h3:has-text("${title}")`).first();
     if (await h.isVisible().catch(()=>false)) {
@@ -243,7 +248,6 @@ async function ensureSlotsRendered(page) {
     }
   }
 
-  // чуть-чуть прокрутим
   await page.evaluate(()=>window.scrollBy(0, Math.round(window.innerHeight*0.35))).catch(()=>{});
   await page.waitForTimeout(250);
 }
@@ -268,7 +272,6 @@ async function collectTimesCombined(page) {
     const els = await page.locator(`${WRAP_SEL} ${SLOT_CELL_SEL}`).all().catch(()=>[]);
     for (const el of els) {
       const t = (await el.innerText().catch(()=> '')).trim();
-      // такие innerText часто содержат «07:00 7 000 ₽» — вытащим время регэкспом
       const n = normTime(t);
       if (n) out.add(n);
     }
@@ -288,7 +291,6 @@ async function collectTimesCombined(page) {
   if (out.size === 0) {
     const els = await page.locator('text=/^\\s*\\d{1,2}:\\d{2}\\s*$/').all().catch(()=>[]);
     for (const el of els) {
-      // фильтруем только те, что лежат внутри WRAP
       const ok = await el.evaluate((node, sel) => {
         let p = node.parentElement;
         while (p) { if (p.matches?.(sel)) return true; p = p.parentElement; }
@@ -396,6 +398,20 @@ function diffSchedules(prev, curr) {
   return { hasChange, text: lines.join('\n') };
 }
 
+// ---------- retry / error classify ----------
+function isProxyRetryableError(e) {
+  const msg = (e && (e.message || e.toString())) ? String(e.message || e.toString()) : '';
+  return (
+    msg.includes('ERR_TUNNEL_CONNECTION_FAILED') ||
+    msg.includes('ERR_PROXY_CONNECTION_FAILED') ||
+    msg.includes('ERR_SOCKS_CONNECTION_FAILED') ||
+    msg.includes('ERR_CONNECTION_CLOSED') ||
+    msg.includes('ERR_CONNECTION_RESET') ||
+    msg.includes('net::ERR_TIMED_OUT') ||
+    msg.includes('Timeout') // часто Playwright пишет "page.goto: Timeout ..."
+  );
+}
+
 // ---------- main ----------
 async function main() {
   const start = Date.now();
@@ -406,58 +422,95 @@ async function main() {
     : [];
   const candidates = shuffle(fromEnv);
 
+  // Проверка всех прокси (для отчёта)
   const probeResults = [];
-  let chosenProxy = null;
+  const alive = [];
   for (const p of candidates) {
     try {
       const ip = await testProxyReachable(p);
       probeResults.push(`✔ ${p} (${ip})`);
-      if (!chosenProxy) chosenProxy = p; // первый успешно отвечающий
+      alive.push(p);
     } catch (e) {
       probeResults.push(`✖ ${p} (${e.message || String(e)})`);
     }
   }
 
-  const { browser, server } = await launchBrowserWithProxy(chosenProxy);
-  const ctx = await browser.newContext({ viewport: { width: 1280, height: 1500 } });
-  const page = await ctx.newPage();
+  // Порядок попыток:
+  // 1) все "живые" по ifconfig (в перемешанном порядке)
+  // 2) в конце без прокси (часто не срабатывает, но пусть будет)
+  const attempts = [...alive, null];
 
-  const usedProxyNote = chosenProxy ? chosenProxy : 'без прокси';
+  let lastError = null;
+  let lastUsedProxyNote = 'без прокси';
 
-  try {
-    log('🌐 Открываем сайт:', TARGET_URL);
-    await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  for (let idx = 0; idx < attempts.length; idx++) {
+    const chosenProxy = attempts[idx];
+    const usedProxyNote = chosenProxy ? chosenProxy : 'без прокси';
+    lastUsedProxyNote = usedProxyNote;
 
-    const current = await scrapeAll(page);
-    const prev = await loadPrevState();
+    let browser = null;
+    let ctx = null;
+    let page = null;
+    let server = null;
 
-    const { hasChange, text: diffText } = diffSchedules(prev, current);
+    log(`🧪 Попытка ${idx + 1}/${attempts.length} — прокси: ${usedProxyNote}`);
 
-    if (hasChange) {
-      let msg = '🎾 ТЕКУЩИЕ СЛОТЫ ЛУЖНИКИ (изменения)\n\n';
-      msg += diffText;
-      msg += `\n${COURTS_URL}\n\nПрокси: ${usedProxyNote}\n\nПроверка прокси:\n` + (probeResults.join('\n') || '—');
-      await sendTelegram(msg, true);
-    } else {
-      log('ℹ️ Изменений нет — уведомление не отправляем.');
+    try {
+      const launched = await launchBrowserWithProxy(chosenProxy);
+      browser = launched.browser;
+      server = launched.server;
+
+      ctx = await browser.newContext({ viewport: { width: 1280, height: 1500 } });
+      page = await ctx.newPage();
+
+      log('🌐 Открываем сайт:', TARGET_URL);
+      await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+      const current = await scrapeAll(page);
+      const prev = await loadPrevState();
+
+      const { hasChange, text: diffText } = diffSchedules(prev, current);
+
+      if (hasChange) {
+        let msg = '🎾 ТЕКУЩИЕ СЛОТЫ ЛУЖНИКИ (изменения)\n\n';
+        msg += diffText;
+        msg += `\n${COURTS_URL}\n\nПрокси: ${usedProxyNote}\n\nПроверка прокси:\n` + (probeResults.join('\n') || '—');
+        await sendTelegram(msg, true);
+      } else {
+        log('ℹ️ Изменений нет — уведомление не отправляем.');
+      }
+
+      await saveState(current);
+
+      await safeClose(browser, ctx, server);
+
+      log('⏱ Время выполнения:', ((Date.now() - start) / 1000).toFixed(1) + 's');
+      return; // УСПЕХ — выходим
+    } catch (e) {
+      lastError = e;
+
+      // Попробуем сохранить артефакты для текущей попытки
+      if (page) await dump(page, `fatal-${idx + 1}`);
+
+      // Закрываем ресурсы, чтобы не утекали между попытками
+      await safeClose(browser, ctx, server);
+
+      // Если ошибка "проксишная" и есть ещё попытки — продолжим
+      if (isProxyRetryableError(e) && idx < attempts.length - 1) {
+        log(`↻ Ошибка похожа на прокси/сеть: ${String(e.message || e)} — пробуем следующий прокси...`);
+        continue;
+      }
+
+      // Иначе — не имеет смысла продолжать
+      break;
     }
-
-    await saveState(current);
-
-    await ctx.close();
-    await browser.close();
-    if (server?.startsWith('http://127.0.0.1:')) {
-      try { await proxyChain.closeAnonymizedProxy(server, true); } catch {}
-    }
-
-    log('⏱ Время выполнения:', ((Date.now() - start) / 1000).toFixed(1) + 's');
-  } catch (e) {
-    await dump(page, 'fatal');
-    const err = e && e.message ? e.message : String(e);
-    let msg = `⚠️ Лужники монитор упал\n${err}\n\nПрокси: ${usedProxyNote}\n\nПроверка прокси:\n` + (probeResults.join('\n') || '—');
-    await sendTelegram(msg, false);
-    throw e;
   }
+
+  // Если дошли сюда — все попытки не сработали
+  const err = lastError && lastError.message ? lastError.message : String(lastError);
+  let msg = `⚠️ Лужники монитор упал\n${err}\n\nПрокси: ${lastUsedProxyNote}\n\nПроверка прокси:\n` + (probeResults.join('\n') || '—');
+  await sendTelegram(msg, false);
+  throw lastError;
 }
 
 await main();
